@@ -1,0 +1,18 @@
+name = "stratify"
+defaultTargets = ["Stratify", "stratify"]
+
+[leanOptions]
+autoImplicit = false
+
+[[lean_lib]]
+name = "Stratify"
+
+[[lean_exe]]
+name = "stratify"
+root = "Main"
+
+# No external dependencies. Lean.Data.Json ships in the toolchain itself, and
+# every other need (process listing, file IO, time) is core `IO`. This project
+# is deliberately Mathlib-free: the allocator's arithmetic is over Nat/Int/Float
+# and every proved property is a first-order statement `decide`/`omega` can
+# discharge without a large proof library.
