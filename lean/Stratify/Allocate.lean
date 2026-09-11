@@ -169,8 +169,8 @@ def cronFor (sessionId : String) (sleepSeconds : Nat) : String :=
 /-- Compute one session's plan.
 
 `weights` is every live claimant's weight including this session's own; `myWeight` must
-be one of them. `sprintCost` is the calibrated window cost of a sprint — see
-`Calibrate.lean`; callers pass `g.defaultSprintCost` when no calibration exists yet. -/
+be one of them. Nothing here is calibrated: every input is an observed quantity, so a
+plan is a pure function of the snapshot. -/
 def planFor
     (g : Guards) (now : Epoch) (sessionId : String)
     (windows : List Window) (weights : List Milli) (myWeight : Milli) : Plan :=
@@ -184,7 +184,6 @@ def planFor
     binding := w.kind
     weight := myWeight
     grant := myGrant
-    sprintCost := sprintBudgetFor g myGrant
     sprintBudget := sprintBudgetFor g myGrant
     sleepSeconds := sleep
     cron := cronFor sessionId sleep

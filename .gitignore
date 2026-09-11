@@ -1,3 +1,9 @@
 /lean/.lake/
-/bin/stratify
 *.olean
+
+# Eval output: run directories, aggregate-result.json, report.html.
+/evals/results/
+
+# The binary is built, not committed — `make install`. A committed Mach-O would be
+# wrong on every machine but the one it was built on.
+/bin/

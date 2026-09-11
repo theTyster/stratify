@@ -281,8 +281,6 @@ structure Plan where
   weight : Milli
   /-- This session's share of the binding window's headroom. -/
   grant : Mpp
-  /-- Window cost of one sprint, in `Mpp`, calibrated from observed samples. -/
-  sprintCost : Mpp
   /-- How much of the window one sprint may consume. -/
   sprintBudget : Mpp
   /-- Delay before the next sprint, for `ScheduleWakeup`. -/

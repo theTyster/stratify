@@ -111,6 +111,14 @@ def snapshot (horizon : WindowKind := .fiveHour) : IO Snapshot := do
     if windows.isEmpty then Provenance.unknown
     else if age > WindowKind.fiveHour.nominalSeconds then Provenance.estimated
     else Provenance.measured
+  -- Stamp it onto the windows themselves rather than only onto the snapshot.
+  -- `Sample.windows` tags every reading `measured` — true of the sample, but the
+  -- decision that matters is whether it is still a measurement *now*, and that is what
+  -- `prov` decides. Leaving the windows' own tag alone meant `plan` (which reports the
+  -- binding window's provenance) and `status --json`'s per-window field both announced
+  -- a six-hour-old reading as measured while the summary line said estimated. One
+  -- source of truth, downgraded once, here.
+  let windows := windows.map (fun w => { w with prov := prov })
   return { now := now, from_ := from_, sessions := enriched
            windows := windows, prov := prov, readingAge := age }
 
@@ -123,9 +131,5 @@ def totalTokens (s : Snapshot) : Tokens :=
 /-- Claimant weights, in registry order. -/
 def weights (s : Snapshot) (priorityOf : String → Priority) : List Milli :=
   (s.sessions.map (fun r => weightOf (priorityOf r.sessionId))).toList
-
-/-- The binding window for this snapshot. -/
-def binding (s : Snapshot) (g : Guards) : Window :=
-  bindingWindow g s.now s.windows
 
 end Stratify.Collect

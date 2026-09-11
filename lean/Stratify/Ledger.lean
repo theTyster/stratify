@@ -106,9 +106,12 @@ theorem le_max2_right (a b : Key) : ble b (max2 a b) = true := by
   unfold max2
   split
   · exact ble_refl b
-  · rcases ble_total a b with h | h
-    · rename_i hne; exact absurd h (by simp [hne])
-    · assumption
+  · rename_i hne
+    -- The `else` branch hypothesis is already `¬(ble a b = true)`, so `absurd` applies
+    -- directly; no `simp` round-trip is needed to get there.
+    rcases ble_total a b with h | h
+    · exact absurd h hne
+    · exact h
 
 theorem max2_eq_or (a b : Key) : max2 a b = a ∨ max2 a b = b := by
   unfold max2; split
