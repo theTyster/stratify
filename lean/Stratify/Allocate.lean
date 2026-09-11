@@ -124,14 +124,29 @@ def grant (budget : Mpp) (w : Milli) (total : Milli) : Mpp :=
 def clampSleep (g : Guards) (s : Nat) : Nat :=
   max g.minSleep (min g.maxSleep s)
 
+/-- How many sprints the grant divides into.
+
+At least one, so the runway is never divided by zero and a session with any budget at
+all is always told to do something. -/
+def sprintsFor (g : Guards) (grantMpp : Mpp) : Nat :=
+  max 1 (grantMpp / g.minSprintMpp)
+
+/-- Window slice for a single sprint. -/
+def sprintBudgetFor (g : Guards) (grantMpp : Mpp) : Mpp :=
+  grantMpp / sprintsFor g grantMpp
+
 /-- The interval between sprints.
 
-A session may burn `grant` mpp over `runway` seconds. One sprint costs `sprintCost`
-mpp. Firing a sprint every `sprintCost · runway / grant` seconds spends the grant
-smoothly across the whole runway instead of in a burst at the start. -/
-def sleepFor (g : Guards) (grantMpp sprintCost : Mpp) (runway : Nat) : Nat :=
+A session owns `grant` mpp over `runway` seconds. Cutting the grant into
+`sprintsFor` slices and the runway into the same number of intervals spends the grant
+evenly across the whole window instead of in a burst at the start.
+
+Note what is *not* here: any conversion between tokens and window percentage. Both
+inputs are observed — the grant from a statusline reading, the runway from an observed
+`resets_at` — so there is no empirical constant to get wrong. -/
+def sleepFor (g : Guards) (grantMpp : Mpp) (runway : Nat) : Nat :=
   if grantMpp = 0 then g.maxSleep
-  else clampSleep g (sprintCost * runway / grantMpp)
+  else clampSleep g (runway / sprintsFor g grantMpp)
 
 /-- Cadence as a 5-field cron expression.
 
@@ -158,21 +173,19 @@ be one of them. `sprintCost` is the calibrated window cost of a sprint — see
 `Calibrate.lean`; callers pass `g.defaultSprintCost` when no calibration exists yet. -/
 def planFor
     (g : Guards) (now : Epoch) (sessionId : String)
-    (windows : List Window) (weights : List Milli) (myWeight : Milli)
-    (sprintCost : Mpp) : Plan :=
+    (windows : List Window) (weights : List Milli) (myWeight : Milli) : Plan :=
   let w := bindingWindow g now windows
   let budget := budgetOf g w now
   let runway := runwayOf w now
   let total := totalWeight weights
   let myGrant := grant budget myWeight total
-  let sprintBudget := min sprintCost myGrant
-  let sleep := sleepFor g myGrant sprintCost runway
+  let sleep := sleepFor g myGrant runway
   { sessionId := sessionId
     binding := w.kind
     weight := myWeight
     grant := myGrant
-    sprintCost := sprintCost
-    sprintBudget := sprintBudget
+    sprintCost := sprintBudgetFor g myGrant
+    sprintBudget := sprintBudgetFor g myGrant
     sleepSeconds := sleep
     cron := cronFor sessionId sleep
     secondsLeft := runway
@@ -230,12 +243,33 @@ theorem clampSleep_bounds (g : Guards) (s : Nat) (h : g.minSleep ≤ g.maxSleep)
   exact Nat.max_le.mpr ⟨h, Nat.min_le_left _ _⟩
 
 /-- The same bound, for the interval actually emitted. -/
-theorem sleepFor_bounds (g : Guards) (gm sc runway : Nat) (h : g.minSleep ≤ g.maxSleep) :
-    g.minSleep ≤ sleepFor g gm sc runway ∧ sleepFor g gm sc runway ≤ g.maxSleep := by
+theorem sleepFor_bounds (g : Guards) (gm runway : Nat) (h : g.minSleep ≤ g.maxSleep) :
+    g.minSleep ≤ sleepFor g gm runway ∧ sleepFor g gm runway ≤ g.maxSleep := by
   unfold sleepFor
   split
   · exact ⟨h, Nat.le_refl _⟩
   · exact clampSleep_bounds g _ h
+
+/-- **4b. The sprint schedule does not overspend the grant.**
+
+Running every sprint the plan allows for consumes no more than the grant it was derived
+from. Without this, property 1 would only bound a single instant: the split could be
+sound while the sequence of sprints it licenses still blew through the window. -/
+theorem sprint_schedule_within_grant (g : Guards) (grantMpp : Mpp) :
+    sprintsFor g grantMpp * sprintBudgetFor g grantMpp ≤ grantMpp := by
+  unfold sprintBudgetFor
+  exact Nat.mul_div_le grantMpp (sprintsFor g grantMpp)
+
+/-- A sprint never claims more than the whole grant, however small the grant is. -/
+theorem sprintBudget_le_grant (g : Guards) (grantMpp : Mpp) :
+    sprintBudgetFor g grantMpp ≤ grantMpp := by
+  unfold sprintBudgetFor
+  exact Nat.div_le_self _ _
+
+/-- There is always at least one sprint, so the runway is never divided by zero. -/
+theorem sprintsFor_pos (g : Guards) (grantMpp : Mpp) : 0 < sprintsFor g grantMpp := by
+  unfold sprintsFor
+  exact Nat.lt_of_lt_of_le Nat.zero_lt_one (Nat.le_max_left _ _)
 
 /-- **6. Rollover safety.** Once the window has reset, the budget is the full ceiling
 and the runway is strictly positive — never a negative or zero interval to divide by.

@@ -314,9 +314,14 @@ structure Guards where
   /-- Never sleep longer than this in one hop. `ScheduleWakeup` clamps to 3600 anyway,
   and a longer hop makes the loop unresponsive to changes in the session population. -/
   maxSleep : Nat := 3600
-  /-- Fallback sprint cost when no calibration data exists yet, in `Mpp`
-  (1 % of the window). Only used while `prov ≠ measured`. -/
-  defaultSprintCost : Mpp := 1000
+  /-- Smallest slice of the window worth waking up to spend, in `Mpp` (0.5 %).
+
+  This is what makes the schedule calibration-free. Rather than converting tokens to
+  window percentage — which needs an empirical constant that could be wrong, and would
+  mis-pace everything if it were — the grant is simply divided into slices of at least
+  this size, and the runway is divided into that many sprints. Both quantities are
+  observed directly. -/
+  minSprintMpp : Mpp := 500
   /-- Re-sample the session population at least this often, in sprints. -/
   resampleEvery : Nat := 4
   deriving Repr, DecidableEq, Inhabited

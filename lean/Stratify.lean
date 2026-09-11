@@ -6,5 +6,6 @@ import Stratify.Ndjson
 import Stratify.Sessions
 import Stratify.Transcript
 import Stratify.Cowork
+import Stratify.Ledger
 import Stratify.Allocate
 import Stratify.Collect

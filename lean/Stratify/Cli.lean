@@ -7,6 +7,7 @@ import Stratify.Paths
 import Stratify.Sessions
 import Stratify.Transcript
 import Stratify.Cowork
+import Stratify.Ledger
 import Stratify.Allocate
 import Stratify.Collect
 
@@ -69,6 +70,17 @@ def provLabel : Provenance → String
   | .measured => "measured"
   | .estimated => "estimated"
   | .unknown => "UNKNOWN"
+
+/-! ## Argument handling -/
+
+/-- Value of a `--flag value` pair. -/
+def flagValue (args : List String) (flag : String) : Option String :=
+  match args with
+  | [] => none
+  | a :: rest => if a == flag then rest.head? else flagValue rest flag
+
+def hasFlag (args : List String) (flag : String) : Bool :=
+  args.any (· == flag)
 
 /-! ## The sensor -/
 
@@ -200,6 +212,141 @@ def status (asJson : Bool) : IO UInt32 := do
     IO.print (renderStatus snap home)
   return 0
 
+/-! ## plan
+
+The machine interface. JSON by default, because the consumer is an agent following
+`SKILL.md`, and a human-readable default would mean every skill invocation had to
+remember a flag. -/
+
+/-- Resolve the session id: explicit flag, else the environment.
+
+Claude Code exports `CLAUDE_CODE_SESSION_ID` into every session, so an agent asking
+about itself does not have to discover its own id — which it has no reliable way to do
+otherwise. -/
+def resolveSessionId (explicit : Option String) : IO (Option String) := do
+  match explicit with
+  | some s => return some s
+  | none => return ← IO.getEnv "CLAUDE_CODE_SESSION_ID"
+
+/-- Build a plan for one session. -/
+def buildPlan (g : Guards) (snap : Collect.Snapshot) (entries : List Ledger.Entry)
+    (sid : String) (niceOverride : Option Int) : Plan :=
+  -- An explicit `--nice` on this invocation applies to this session only, and does not
+  -- outrank a recorded user declaration.
+  let priorityOf := fun (s : String) =>
+    let recorded := Ledger.priorityOf entries s
+    match niceOverride with
+    | some n =>
+      if s == sid && recorded.source != .user then
+        { recorded with nice := Nice.ofInt n, source := .inferred }
+      else recorded
+    | none => recorded
+  let weights := Collect.weights snap priorityOf
+  let myWeight := weightOf (priorityOf sid)
+  -- A session that is not in the registry is still planned for, but it has to be added
+  -- as a claimant: otherwise it would be handed a share of a window it was not counted
+  -- against, and the split would oversubscribe.
+  let known := snap.sessions.any (·.sessionId == sid)
+  let allWeights := if known then weights else myWeight :: weights
+  planFor g snap.now sid snap.windows allWeights myWeight
+
+def planJson (p : Plan) (snap : Collect.Snapshot) : Json :=
+  Json.mkObj
+    [("session_id", Json.str p.sessionId),
+     ("binding_window", Json.str p.binding.key),
+     ("weight", Json.num (JsonNumber.fromNat p.weight)),
+     ("claimants", Json.num (JsonNumber.fromNat p.claimants)),
+     ("grant_mpp", Json.num (JsonNumber.fromNat p.grant)),
+     ("grant_percentage", Json.str (fmtPct p.grant)),
+     ("sprint_budget_mpp", Json.num (JsonNumber.fromNat p.sprintBudget)),
+     ("sprint_budget_percentage", Json.str (fmtPct p.sprintBudget)),
+     ("sprints_remaining", Json.num (JsonNumber.fromNat (sprintsFor Guards.default p.grant))),
+     ("sleep_seconds", Json.num (JsonNumber.fromNat p.sleepSeconds)),
+     ("cron", Json.str p.cron),
+     ("seconds_left", Json.num (JsonNumber.fromNat p.secondsLeft)),
+     ("minutes_left", Json.num (JsonNumber.fromNat (Time.toMinutes p.secondsLeft))),
+     ("wait_for_reset", Json.bool p.waitForReset),
+     ("provenance", Json.str (provLabel p.prov)),
+     ("sensor_installed", Json.bool snap.prov.isMeasured),
+     ("resample_every_sprints", Json.num (JsonNumber.fromNat Guards.default.resampleEvery))]
+
+def renderPlan (p : Plan) : String :=
+  let hdr := s!"session {p.sessionId}\n"
+  let bind := s!"  binding window     {p.binding.key}  ({provLabel p.prov})\n"
+  let cl := s!"  claimants          {p.claimants}\n"
+  let wt := s!"  weight             {p.weight} / 1000\n"
+  let gr := s!"  grant              {fmtPct p.grant} of the window\n"
+  let sb := s!"  sprint budget      {fmtPct p.sprintBudget}  "
+              ++ s!"({sprintsFor Guards.default p.grant} sprints remaining)\n"
+  let sl := s!"  sleep between      {Time.humanDuration p.sleepSeconds}  ({p.sleepSeconds}s)\n"
+  let cr := s!"  cron               {p.cron}\n"
+  let lf := s!"  window resets in   {Time.humanDuration p.secondsLeft}\n"
+  let wr := if p.waitForReset then
+      "\n  BUDGET EXHAUSTED — wait for the window to reset before the next sprint.\n"
+    else ""
+  hdr ++ bind ++ cl ++ wt ++ gr ++ sb ++ sl ++ cr ++ lf ++ wr
+
+def plan (args : List String) : IO UInt32 := do
+  match ← resolveSessionId (flagValue args "--session") with
+  | none =>
+    IO.eprintln "stratify: no session id (pass --session, or run inside a Claude session)"
+    return 2
+  | some sid =>
+    let niceOverride := (flagValue args "--nice").bind (fun s => s.toInt?)
+    let snap ← Collect.snapshot
+    let entries ← Ledger.load
+    let p := buildPlan Guards.default snap entries sid niceOverride
+    if hasFlag args "--human" then IO.print (renderPlan p)
+    else IO.println (planJson p snap).pretty
+    return 0
+
+/-! ## claim -/
+
+def claim (args : List String) : IO UInt32 := do
+  match ← resolveSessionId (flagValue args "--session") with
+  | none =>
+    IO.eprintln "stratify: no session id (pass --session, or run inside a Claude session)"
+    return 2
+  | some sid =>
+    match (flagValue args "--nice").bind (fun s => s.toInt?) with
+    | none =>
+      IO.eprintln "stratify: claim needs --nice N  (-20 most favoured, 19 most yielding)"
+      return 2
+    | some n =>
+      let now ← Time.nowEpoch
+      -- `--user` marks a declaration authoritative. This expresses intent; it is not a
+      -- security boundary, since an agent could pass the flag too. The rank exists so
+      -- that a human's declaration is not silently overwritten by a later agent one.
+      let source := if hasFlag args "--user" then PrioritySource.user else .inferred
+      Ledger.declare { ts := now, sessionId := sid, nice := n, source := source }
+      let clamped := Nice.ofInt n
+      IO.println s!"stratify: {sid} nice={clamped.val} ({source.toString}), weight {niceWeight clamped}/1000"
+      return 0
+
+/-! ## gc -/
+
+def gc (args : List String) : IO UInt32 := do
+  let days := ((flagValue args "--days").bind (fun s => s.toNat?)).getD 8
+  let now ← Time.nowEpoch
+  let cutoff := now - days * 24 * 3600
+  let dropped ← Ledger.compact cutoff
+  -- Samples are compacted the same way: read, filter, rename.
+  let spath ← Paths.samplesFile
+  let mut sDropped := 0
+  if ← spath.pathExists then
+    let lines ← Ndjson.readAll spath
+    let kept := lines.toList.filter fun l =>
+      match Ndjson.decodeSample l with
+      | some s => s.ts ≥ cutoff
+      | none => false
+    sDropped := lines.size - kept.length
+    if sDropped > 0 then
+      let tmp := spath.withExtension "ndjson.tmp"
+      IO.FS.writeFile tmp (String.intercalate "\n" kept ++ "\n")
+      IO.FS.rename tmp spath
+  IO.println s!"stratify: dropped {sDropped} samples and {dropped} ledger records older than {days}d"
+  return 0
+
 /-! ## Help -/
 
 def usage : String :=
@@ -242,15 +389,5 @@ idle, and a session that stops reporting looks like one that stopped spending.
 exactly as it does now."
   return 0
 
-/-! ## Argument handling -/
-
-/-- Value of a `--flag value` pair. -/
-def flagValue (args : List String) (flag : String) : Option String :=
-  match args with
-  | [] => none
-  | a :: rest => if a == flag then rest.head? else flagValue rest flag
-
-def hasFlag (args : List String) (flag : String) : Bool :=
-  args.any (· == flag)
 
 end Stratify.Cli
