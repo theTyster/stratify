@@ -1,0 +1,17 @@
+{
+  "name": "stratify",
+  "owner": {
+    "name": "Ty Davis",
+    "email": "tyler.davis@fortyau.com"
+  },
+  "description": "Session-limit load balancer for concurrent Claude sessions",
+  "plugins": [
+    {
+      "name": "stratify",
+      "source": ".",
+      "description": "Pace long-running autonomous work against Claude's shared rate-limit window. Reads the window, takes a nice-weighted share, and sizes sprints to it.",
+      "version": "0.1.0",
+      "category": "workflow"
+    }
+  ]
+}

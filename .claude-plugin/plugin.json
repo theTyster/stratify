@@ -2,7 +2,10 @@
   "name": "stratify",
   "description": "Stratify token spend across concurrent Claude sessions: read the shared rate-limit window, take a nice-weighted share of it, and pace work into sprints so the window is consumed evenly instead of all at once.",
   "version": "0.1.0",
-  "author": "Ty Davis",
+  "author": {
+    "name": "Ty Davis",
+    "email": "tyler.davis@fortyau.com"
+  },
   "experimental": {
     "evals": "evals"
   }
