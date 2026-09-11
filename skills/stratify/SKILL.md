@@ -103,8 +103,18 @@ without the previous wake's working context, so anything not written down is los
 
 ### 5. Schedule the next wake
 
-**Inside `/loop`** — use `ScheduleWakeup` with the current `sleep_seconds`, which
-recomputes the plan every iteration:
+Pick exactly one mechanism per run. Do not schedule both — two wake sources double the
+spend against a grant computed for one.
+
+#### Use `ScheduleWakeup` when
+
+- the work is running inside `/loop`, or otherwise re-enters the same prompt each time;
+- the interval is irregular, because `sleep_seconds` changes as claimants come and go;
+- the next wake is a one-off — including the post-reset wake in step 6;
+- the user is present and the run is expected to finish within this session.
+
+`ScheduleWakeup` fires once. Re-arm it at the end of every sprint, using the
+`sleep_seconds` from the most recent `stratify plan`:
 
 ```text
 ScheduleWakeup({
@@ -114,9 +124,43 @@ ScheduleWakeup({
 })
 ```
 
-**Long unattended runs** — use `CronCreate` with the returned `cron` expression. Two
-limits apply: recurring jobs expire after 7 days, and they fire only while the session is
-idle. Tell the user about the 7-day expiry whenever you create one.
+If a sprint ends without re-arming, the run stops. That is the intended failure mode:
+it stalls rather than overspending.
+
+#### Use `CronCreate` when
+
+- the run is long and unattended, spanning hours or days with no operator present;
+- the cadence from `plan.cron` is stable enough to repeat;
+- the work must survive this session ending.
+
+**Every cron this skill creates must be durable.** Always pass `durable: true`:
+
+```text
+CronCreate({
+  schedule: <plan.cron>,
+  prompt: <sprint instruction plus path to the progress note>,
+  durable: true,
+  reason: "stratified sprints, 5h window, grant 6.1%, 4 claimants"
+})
+```
+
+A durable job is re-registered rather than left to lapse, so it is not lost when the
+session exits and does not silently disappear at the 7-day mark that non-durable
+recurring jobs hit. Never create a non-durable cron for stratified work: a lapsed job
+looks identical to completed work, and the progress note is then the only evidence that
+the run was abandoned mid-task.
+
+Two behaviours still apply and should be stated to the user when you create the job:
+
+- cron jobs fire only while the session is idle, so a long sprint can displace the next
+  tick;
+- durability keeps the job alive, but it does not keep it *correct* — the schedule was
+  computed against the claimant count at creation time.
+
+So list and prune jobs as part of the run. Use `CronList` to confirm exactly one
+stratify job exists, and `CronDelete` to remove stale or duplicate ones before creating
+a replacement. When `resample_every_sprints` triggers a re-plan and `plan.cron` has
+changed, delete the old job and create a new durable one rather than leaving both.
 
 Either way, re-run `stratify plan` every `resample_every_sprints` sprints (default 4).
 Never rely on a cached plan: an allocation computed against 3 claimants is wrong once 13
@@ -124,9 +168,12 @@ sessions are sharing the window.
 
 ### 6. Wait for a reset when required
 
-When `wait_for_reset` is `true`, do not begin a sprint. Schedule the next wake past
-`seconds_left` and stop. After the reset, re-run `stratify plan` and continue — nothing
-else is needed, which is another reason to re-sample rather than cache.
+When `wait_for_reset` is `true`, do not begin a sprint. Schedule a single
+`ScheduleWakeup` past `seconds_left` and stop — a one-off wake is the right shape here,
+even if the surrounding run is driven by a durable cron. If a cron is already armed,
+leave it in place; it will find `wait_for_reset` still true and stop again, which is
+cheap and correct. After the reset, re-run `stratify plan` and continue — nothing else
+is needed, which is another reason to re-sample rather than cache.
 
 ## Housekeeping
 
@@ -145,5 +192,8 @@ These are not style notes; they are the point of the tool.
 - **Report incomplete work.** If a sprint was skipped, ended early, or failed its
   planned unit, say so at the next wake. A run that reports failure beats one that
   silently stops.
+- **Report scheduling state.** Say which mechanism is armed, and for crons, that the job
+  is durable and what its schedule is. An unattended run the user cannot see must be
+  auditable from the progress note alone.
 - **Read `claimants` correctly.** It counts sessions that *could* spend, including idle
   ones. Excluding an idle session would starve it the moment it woke.
