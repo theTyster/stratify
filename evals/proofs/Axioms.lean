@@ -156,6 +156,112 @@ example : live.rolledOver afterReset = false := by decide
 example : budgetOf g live afterReset = 48800 := by decide
 example : runwayOf live afterReset = 14400 := by decide
 
+/-! ## 7 and 8. Not knowing, at the numbers that produced the defect
+
+The witness here is not invented. It is the incident: the readings actually in this
+account's `samples.ndjson` at the moment `stratify status` reported a full weekly
+allowance while the five-hour window sat at 97 % used.
+
+Both readings had outlived the windows they measured. `u5 = 44.0 %` was written at
+`t = 1789160999` against `r5 = 1789161000` — one second before that window reset — and
+`u7 = 93.0 %` at `t = 1789178387` against `r7 = 1789178400`, thirteen seconds before
+that one did. Each window then vanished from the statusline payload, because Claude
+Code drops a window once its `resets_at` passes. -/
+
+def incidentNow : Epoch := 1789186214
+
+def lapsed5h : Window :=
+  { kind := .fiveHour, used := 44000, resetsAt := 1789161000
+    observedAt := 1789160999, prov := .measured }
+
+def lapsed7d : Window :=
+  { kind := .sevenDay, used := 93000, resetsAt := 1789178400
+    observedAt := 1789178387, prov := .measured }
+
+-- Both readings are of windows that reset hours ago: seven and two hours respectively.
+example : incidentNow - lapsed5h.resetsAt = 25214 := by decide
+example : incidentNow - lapsed7d.resetsAt = 7814 := by decide
+
+-- So both are expired, and neither may be scheduled against.
+example : lapsed5h.state g.rolloverGrace incidentNow = WindowState.expired := by decide
+example : lapsed7d.state g.rolloverGrace incidentNow = WindowState.expired := by decide
+example : lapsed5h.usable g.rolloverGrace incidentNow = false := by decide
+example : lapsed7d.usable g.rolloverGrace incidentNow = false := by decide
+
+-- And neither is a measurement. Under the old age-based rule the seven-day reading was
+-- two hours old against a five-hour threshold, so it was reported `measured` — of a
+-- window that had already reset.
+example : lapsed7d.provAt g.staleAfter g.rolloverGrace incidentNow = Provenance.unknown := by
+  decide
+example : incidentNow - lapsed7d.observedAt ≤ g.staleAfter := by decide
+
+-- The plan that follows: one minimum sprint, labelled unknown, and no stall. Before the
+-- change this session was offered 6.9 % of the window over thirteen sprints.
+-- `#guard` rather than `decide`: a `Plan` carries a `String` session id.
+#guard (planFor g incidentNow "s" [] weights 1000).grant == g.minSprintMpp
+#guard (planFor g incidentNow "s" [] weights 1000).prov == Provenance.unknown
+#guard (planFor g incidentNow "s" [] weights 1000).waitForReset == false
+
+/-! ### The blind cadence, at the claimant counts that actually occur
+
+A bounded grant is not a bounded spend. Repeating a 0.5 % sprint at the shortest legal
+sleep is 30 % of the window an hour — worse, over a long blind stretch, than the
+fail-open behaviour it replaces. So the interval is derived from the claimant count, and
+these are the numbers it produces. -/
+
+-- Thirteen sessions, the population on this account when the defect was found: one
+-- sprint every 21 minutes, which is an equal share of a five-hour window at the ceiling.
+example : unknownSleep g 13 = 1300 := by decide
+example : 3600 / 1300 * g.minSprintMpp < 90000 / 13 / 5 + 1 := by decide
+
+-- Alone, it is faster; in a crowd, slower. Neither escapes the guard rails.
+example : unknownSleep g 1 = 100 := by decide
+example : unknownSleep g 4 = 400 := by decide
+example : unknownSleep g 100 = g.maxSleep := by decide
+example : g.minSleep ≤ unknownSleep g 1 ∧ unknownSleep g 1 ≤ g.maxSleep := by decide
+
+-- Monotone, non-trivially: the interval genuinely moves with the population rather than
+-- sitting on a clamp for every realistic input.
+example : unknownSleep g 1 < unknownSleep g 13 := by decide
+example : unknownSleep g 13 < unknownSleep g 36 := by decide
+
+#guard (planFor g incidentNow "s" [] weights 1000).sleepSeconds == unknownSleep g 4
+
+-- Non-vacuity in the other direction: the bound is a real restriction, not the value
+-- the allocator would have produced anyway. The same session with a live reading gets
+-- twenty-four times as much.
+#guard (planFor g afterReset "s" [live] weights 1000).grant == 12200
+example : g.minSprintMpp < 12200 := by decide
+
+-- And the grace branch is reachable, so `expired` is not simply what every rolled-over
+-- reading becomes. A window that reset thirty seconds ago still restores the ceiling —
+-- the behaviour "after the five hours pass, keep working" depends on.
+def justRolled : Window :=
+  { rolled with resetsAt := afterReset - 30, observedAt := afterReset - 90 }
+
+example : justRolled.state g.rolloverGrace afterReset = WindowState.rolledOver := by decide
+example : justRolled.usable g.rolloverGrace afterReset = true := by decide
+example : budgetOf g justRolled afterReset = g.ceiling := by decide
+example : 0 < runwayOf justRolled afterReset := by decide
+
+-- A rolled-over reading is an inference about the replacement window, never a
+-- measurement of it, and says so.
+example : justRolled.provAt g.staleAfter g.rolloverGrace afterReset = Provenance.estimated := by
+  decide
+
+-- All three states are inhabited, so no branch of the classification is dead.
+example : live.state g.rolloverGrace afterReset = WindowState.live := by decide
+
+-- Where the grace line falls. `rolled` above sits 605 s past its reset, so it is past
+-- the five-minute grace and reads as expired — a deliberate boundary, not an oversight:
+-- ten minutes of thirteen concurrent sessions spending into an unobserved window is
+-- already a real quantity, and assuming it is zero is the direction that overspends.
+-- `budgetOf_rolledOver` still holds of it, because that theorem is about `rolledOver`,
+-- which asks only whether the reset time has passed.
+example : afterReset - rolled.resetsAt = 605 := by decide
+example : rolled.state g.rolloverGrace afterReset = WindowState.expired := by decide
+example : budgetOf g rolled afterReset = g.ceiling := by decide
+
 /-! ## 5. Ledger determinism — the reordering is observable
 
 Swapping two records is only an interesting invariance if the records differ and if the
@@ -206,5 +312,16 @@ that nothing outside Lean's standard three axioms appears. -/
 -- 6. Rollover safety.
 #print axioms Stratify.budgetOf_rolledOver
 #print axioms Stratify.runwayOf_pos
+-- 7. An unknown window is bounded, does not stall, is labelled, and its cadence is
+-- bounded and does not speed up as claimants arrive.
+#print axioms Stratify.unknown_is_bounded
+#print axioms Stratify.unknown_does_not_stall
+#print axioms Stratify.unknown_is_labelled
+#print axioms Stratify.unknownSleep_bounds
+#print axioms Stratify.unknownSleep_mono
+-- 8. An expired reading is not evidence.
+#print axioms Stratify.state_expired_of_long_past
+#print axioms Stratify.expired_not_measured
+#print axioms Stratify.expired_not_usable
 
 end Stratify.Evals

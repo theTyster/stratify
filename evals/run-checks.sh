@@ -224,7 +224,7 @@ section "Axiom hygiene and non-vacuity"
 if (cd "$LEAN" && lake env lean "$REPO/evals/proofs/Axioms.lean" >"$WORK/axioms.log" 2>&1); then
   ok "evals/proofs/Axioms.lean elaborates (non-vacuity witnesses hold)"
   n_thms=$(grep -c 'depends on axioms' "$WORK/axioms.log" | tr -d ' ')
-  chk "all twelve properties reported an axiom set" "$n_thms" "12"
+  chk "all twenty properties reported an axiom set" "$n_thms" "20"
   if grep -q 'sorryAx' "$WORK/axioms.log"; then
     bad "no sorryAx" "$(grep sorryAx "$WORK/axioms.log")"
   else
@@ -288,11 +288,22 @@ else
   bad "record garbage passthrough" "stdout differs from stdin"
 fi
 
-# A payload with no window reading teaches nothing and must not cost a line.
+# A payload with no window reading is logged as a heartbeat.
+#
+# This assertion is the reverse of what it was. Claude Code drops each window from the
+# payload once its `resets_at` passes, so "no rate_limits" is the steady state between a
+# reset and the next reading — on this account it lasted over two hours. Skipping those
+# renders froze the sensor log and made a healthy sensor indistinguishable from an
+# absent one. The heartbeat is the only evidence that the sensor ran and saw nothing.
 mkpayload "$SID" >"$E/nowin.json"
 sx "$E" record <"$E/nowin.json" >/dev/null 2>&1
-chk "a payload with no rate_limits is not logged" \
-  "$(wc -l <"$E/state/samples.ndjson" | tr -d ' ')" "1"
+chk "a payload with no rate_limits is logged as a heartbeat" \
+  "$(wc -l <"$E/state/samples.ndjson" | tr -d ' ')" "2"
+if grep -q '"u5"\|"u7"\|"us"' <(tail -1 "$E/state/samples.ndjson"); then
+  bad "heartbeat carries no window" "the windowless record has a window field"
+else
+  ok "and the heartbeat carries no window reading"
+fi
 
 # Atomicity depends on one write(2) staying under PIPE_BUF.
 longest=$(awk '{ print length($0) + 1 }' "$E/state/samples.ndjson" | sort -rn | head -1)
@@ -381,7 +392,23 @@ printf '{"t":%d,"s":"%s","m":"claude-opus-5","u7":58000,"r7":%d}\n' \
   "$((NOW - 30))" "$SID" "$((NOW + 3 * 86400))" >"$E/state/samples.ndjson"
 sx "$E" plan --session "$SID" >"$E/plan.json" 2>/dev/null
 chk "a 30s-old reading is reported measured" "$(jget provenance <"$E/plan.json")" "measured"
-chk "and sensor_installed flips true"        "$(jget sensor_installed <"$E/plan.json")" "true"
+# A recent sample means the sensor is *running*. Whether it is *installed* is a separate
+# question with a separate answer, read from settings.json. Deriving one from the other
+# is what had `status` advising the user to install a sensor that was already running.
+chk "and a recent sample means the sensor is live" "$(jget sensor_live <"$E/plan.json")" "true"
+chk "but installation is not inferred from it" \
+  "$(jget sensor_installed <"$E/plan.json")" "false"
+
+# With the shim actually in settings.json, installation reports true — and does so on
+# the strength of the settings file, not of any reading.
+E=$(new_env installed)
+printf '{"statusLine":{"type":"command","command":"stratify record | bash x.sh","refreshInterval":15}}\n' \
+  >"$E/home/.claude/settings.json"
+sx "$E" plan --session "$SID" >"$E/plan.json" 2>/dev/null
+chk "the shim in settings.json reports installed" \
+  "$(jget sensor_installed <"$E/plan.json")" "true"
+chk "with no samples the sensor is not live"  "$(jget sensor_live <"$E/plan.json")" "false"
+chk "and the window is still UNKNOWN"          "$(jget provenance  <"$E/plan.json")" "UNKNOWN"
 
 # ---------------------------------------------------------------------------
 section "Binding window selection"

@@ -28,6 +28,8 @@ allowed_tools: [Bash, Read, Glob, Grep, Skill]
   "wait_for_reset": false,
   "provenance": "estimated",
   "sensor_installed": false,
+  "sensor_live": false,
+  "unknown_windows": ["five_hour"],
   "resample_every_sprints": 4
 }
 ```

@@ -39,6 +39,10 @@ def sessionsDir : IO System.FilePath := do return (← home) / ".claude" / "sess
 /-- Per-project transcript directories. -/
 def projectsDir : IO System.FilePath := do return (← home) / ".claude" / "projects"
 
+/-- Global settings. Read to answer "is the statusline shim installed?", which is a
+different question from "is a reading fresh?" and must not be inferred from one. -/
+def settingsFile : IO System.FilePath := do return (← home) / ".claude" / "settings.json"
+
 /-- Cowork's session store. Laid out as
 `<root>/<accountUuid>/<orgUuid>/local_<uuid>.json` alongside a `local_<uuid>/`
 directory holding that session's `audit.jsonl`. -/

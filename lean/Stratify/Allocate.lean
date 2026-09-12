@@ -99,8 +99,13 @@ compared by cross-multiplication to stay in exact `Nat` arithmetic:
 def moreBinding (g : Guards) (now : Epoch) (a b : Window) : Window :=
   if budgetOf g a now * runwayOf b now ≤ budgetOf g b now * runwayOf a now then a else b
 
-/-- The binding window across every window observed. `fiveHour` is the fallback when
-nothing has been observed at all. -/
+/-- The binding window across every window observed.
+
+Total on `List Window`, so it needs an answer for the empty list. The answer it gives —
+a window at zero usage — is only ever reached through `planFor`, which handles the
+empty case before calling here. It is *not* a model of "no reading": an unobserved
+window read as `used := 0` is a claim that the window is empty, which is exactly the
+claim that must not be made. See `unknownPlan`. -/
 def bindingWindow (g : Guards) (now : Epoch) (ws : List Window) : Window :=
   match ws with
   | [] =>
@@ -166,14 +171,75 @@ def cronFor (sessionId : String) (sleepSeconds : Nat) : String :=
 
 /-! ## Putting it together -/
 
+/-- The interval between sprints while blind.
+
+A per-plan grant bounds one sprint, not a sequence of them. At the shortest legal sleep
+a session would take a 0.5 % sprint every 60 s — 30 % of the window an hour, twenty-two
+times an equal share, and with no reading arriving to correct it. Bounding the grant
+while leaving the cadence unbounded is not a fail-safe; it is the same fail-open shape
+in slower motion.
+
+So the cadence is derived rather than fixed: spend one minimum sprint per slice of the
+*shortest* window an equal split would allow. That is the rate this session would be
+granted if the five-hour window were at the ceiling and shared evenly, which is the most
+generous assumption available that is not a guess about the reading itself.
+
+Equal shares, not weighted ones: niceness apportions a known quantity, and there is
+nothing known here to apportion. A favourably-niced session should not be able to spend
+faster precisely when nobody can see the window. -/
+def unknownSleep (g : Guards) (claimants : Nat) : Nat :=
+  clampSleep g
+    (WindowKind.fiveHour.nominalSeconds * g.minSprintMpp * (max 1 claimants) / g.ceiling)
+
+/-- The plan issued when no window can be scheduled against.
+
+Both tempting answers are wrong.
+
+Treating an unobserved window as empty is what let a session be handed a full weekly
+grant while the binding window sat at 97 % — the failure this branch exists to prevent.
+But refusing to plan at all is not obviously better: Claude Code can decline to report a
+window for hours, and a tool that stalls every stratified run for that whole time has
+turned a missing reading into an outage.
+
+So: the smallest slice worth waking up for, at a cadence slow enough that repeating it
+indefinitely stays inside an equal share (`unknownSleep`). A session keeps making
+bounded progress, and the moment a real reading appears it gets a real grant. `prov`
+says `unknown`, and the skill is required to pass that through rather than present it as
+a measurement. -/
+def unknownPlan (g : Guards) (sessionId : String) (claimants : Nat)
+    (myWeight : Milli) : Plan :=
+  { sessionId := sessionId
+    -- Nominally the five-hour window: the shortest, hence the most conservative thing
+    -- to be uncertain about. `prov := .unknown` is what carries the real meaning.
+    binding := .fiveHour
+    weight := myWeight
+    grant := g.minSprintMpp
+    sprintBudget := g.minSprintMpp
+    sleepSeconds := unknownSleep g claimants
+    cron := cronFor sessionId (unknownSleep g claimants)
+    -- Not zero because the window is exhausted, but because its runway is unknown.
+    secondsLeft := 0
+    -- Not a reset to wait for: there is no known window to wait on. Waiting here would
+    -- be waiting forever.
+    waitForReset := false
+    prov := .unknown
+    claimants := claimants }
+
 /-- Compute one session's plan.
 
 `weights` is every live claimant's weight including this session's own; `myWeight` must
 be one of them. Nothing here is calibrated: every input is an observed quantity, so a
-plan is a pure function of the snapshot. -/
+plan is a pure function of the snapshot.
+
+`windows` must already be filtered to readings that are still evidence about the
+current window — `Collect.snapshot` drops expired ones. An empty list therefore means
+"nothing is known", not "nothing constrains". -/
 def planFor
     (g : Guards) (now : Epoch) (sessionId : String)
     (windows : List Window) (weights : List Milli) (myWeight : Milli) : Plan :=
+  match windows with
+  | [] => unknownPlan g sessionId weights.length myWeight
+  | _ =>
   let w := bindingWindow g now windows
   let budget := budgetOf g w now
   let runway := runwayOf w now
@@ -281,6 +347,93 @@ theorem runwayOf_pos (w : Window) (now : Epoch) (h : w.rolledOver now = true) :
     0 < runwayOf w now := by
   simp only [runwayOf, h, if_true]
   cases w.kind <;> decide
+
+/-! ### 7. Not knowing is bounded, and is not the same as knowing zero
+
+The defect these three properties close: an unobserved window used to reach the
+allocator as `used := 0`, which is a claim that it is empty. Under a nearly-exhausted
+window that is the most expensive possible wrong answer, because it is wrong in the
+direction of spending. -/
+
+/-- **7a.** With nothing to schedule against, the grant is exactly one minimum sprint —
+never the ceiling, and never zero. Holds for every weight and every claimant count, so
+no priority declaration can talk its way out of the bound. -/
+theorem unknown_is_bounded (g : Guards) (now : Epoch) (sid : String)
+    (weights : List Milli) (myWeight : Milli) :
+    (planFor g now sid [] weights myWeight).grant = g.minSprintMpp := rfl
+
+/-- **7b.** And it does not stall: an unknown window is not a reset to wait for, so a
+run keeps making bounded progress instead of hanging until Claude Code volunteers a
+reading. -/
+theorem unknown_does_not_stall (g : Guards) (now : Epoch) (sid : String)
+    (weights : List Milli) (myWeight : Milli) :
+    (planFor g now sid [] weights myWeight).waitForReset = false := rfl
+
+/-- **7c.** The uncertainty is reported, not absorbed. -/
+theorem unknown_is_labelled (g : Guards) (now : Epoch) (sid : String)
+    (weights : List Milli) (myWeight : Milli) :
+    (planFor g now sid [] weights myWeight).prov = Provenance.unknown := rfl
+
+/-- **7d.** The blind cadence stays inside the guard rails, so bounding the sequence of
+sprints did not come at the cost of a plan that spins or disappears. -/
+theorem unknownSleep_bounds (g : Guards) (c : Nat) (h : g.minSleep ≤ g.maxSleep) :
+    g.minSleep ≤ unknownSleep g c ∧ unknownSleep g c ≤ g.maxSleep :=
+  clampSleep_bounds g _ h
+
+/-- **7e.** The blind cadence does not speed up as more sessions arrive.
+
+Each additional claimant makes every session wait longer, exactly as a smaller share
+would. Without this, going blind with thirteen sessions running would license thirteen
+times the spend of going blind alone. -/
+theorem unknownSleep_mono (g : Guards) {a b : Nat} (h : a ≤ b) :
+    unknownSleep g a ≤ unknownSleep g b := by
+  unfold unknownSleep clampSleep
+  have hmax : max 1 a ≤ max 1 b :=
+    Nat.max_le.mpr ⟨Nat.le_max_left 1 b, Nat.le_trans h (Nat.le_max_right 1 b)⟩
+  have hdiv : WindowKind.fiveHour.nominalSeconds * g.minSprintMpp * (max 1 a) / g.ceiling
+      ≤ WindowKind.fiveHour.nominalSeconds * g.minSprintMpp * (max 1 b) / g.ceiling :=
+    Nat.div_le_div_right (Nat.mul_le_mul_left _ hmax)
+  have hmin : min g.maxSleep
+      (WindowKind.fiveHour.nominalSeconds * g.minSprintMpp * (max 1 a) / g.ceiling)
+      ≤ min g.maxSleep
+      (WindowKind.fiveHour.nominalSeconds * g.minSprintMpp * (max 1 b) / g.ceiling) :=
+    Nat.le_min.mpr ⟨Nat.min_le_left _ _, Nat.le_trans (Nat.min_le_right _ _) hdiv⟩
+  exact Nat.max_le.mpr ⟨Nat.le_max_left _ _, Nat.le_trans hmin (Nat.le_max_right _ _)⟩
+
+/-! ### 8. An expired reading is not evidence
+
+A reading whose `resets_at` passed more than `grace` ago describes a window that has
+since been replaced by one we have never seen. -/
+
+/-- **8a.** Past the grace period, a reading is expired.
+
+Written with explicit `Nat` lemmas rather than `omega`. `Epoch` is an `abbrev` for
+`Nat`, and `omega` declines to collect facts stated at the alias — it reports "no usable
+constraints found" even with the hypothesis in scope. -/
+theorem state_expired_of_long_past (w : Window) (grace : Nat) (now : Epoch)
+    (h : w.resetsAt + grace < now) : w.state grace now = WindowState.expired := by
+  unfold Window.state
+  have h1 : ¬ (now < w.resetsAt) :=
+    Nat.not_lt.mpr (Nat.le_of_lt (Nat.lt_of_le_of_lt (Nat.le_add_right _ grace) h))
+  have h2 : ¬ (now - w.resetsAt ≤ grace) :=
+    Nat.not_le.mpr (Nat.lt_sub_of_add_lt (Nat.add_comm w.resetsAt grace ▸ h))
+  simp [h1, h2]
+
+/-- **8b.** An expired reading is never reported as a measurement, at any staleness
+threshold. This is the claim `status` used to get wrong: it called a two-hour-old
+reading of an already-reset window `measured`, because it compared the reading's age
+against a fixed five hours instead of against the window's own reset time. -/
+theorem expired_not_measured (w : Window) (staleAfter grace : Nat) (now : Epoch)
+    (h : w.state grace now = WindowState.expired) :
+    w.provAt staleAfter grace now = Provenance.unknown := by
+  simp [Window.provAt, h]
+
+/-- **8c.** And it is excluded from the readings the allocator may use, rather than
+being passed through at a lower confidence. There is no honest number to report for a
+window whose replacement was never observed. -/
+theorem expired_not_usable (w : Window) (grace : Nat) (now : Epoch)
+    (h : w.state grace now = WindowState.expired) : w.usable grace now = false := by
+  simp [Window.usable, h]
 
 end Properties
 

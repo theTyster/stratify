@@ -19,8 +19,11 @@ allowed_tools: [Bash, Read, Glob, Grep, Skill]
   "provenance": "UNKNOWN",
   "reading_age_seconds": 0,
   "sensor_installed": false,
+  "sensor_live": false,
+  "sensor_age_seconds": 0,
   "claimants": 6,
   "windows": [],
+  "unknown_windows": [],
   "sessions": [
     {"session_id": "7f2c9a11", "origin": "cli", "model": "claude-opus-5", "status": "busy",  "tokens_in_window": 412000},
     {"session_id": "b1d4e007", "origin": "cli", "model": "claude-opus-5", "status": "idle",  "tokens_in_window": 88000},

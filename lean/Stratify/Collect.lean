@@ -26,6 +26,20 @@ transcripts, the Cowork store, and the sensor log.
 
 That third case is not a hypothetical: it is what every machine looks like until the
 statusline shim is installed.
+
+## Freshness is per window, not per sample
+
+A sample is not a snapshot of every window. Claude Code drops each window from the
+payload independently as its `resets_at` passes, so a later sample carrying only
+`seven_day` says nothing at all about `five_hour` — it is silence, not a reading of
+zero. Selecting the newest *sample* and taking its window list therefore lets a
+partial sample erase a perfectly good reading of the other window.
+
+That is not hypothetical either. In this account's log the last `u5` was written at
+`t=1789160999` against `r5=1789161000`, and the last `u7` at `t=1789178387` against
+`r7=1789178400`: each window vanished from the payload within seconds of its own
+reset, and the samples in between are partial. So readings are folded **per
+`WindowKind`**, each keeping its own observation time.
 -/
 
 namespace Stratify.Collect
@@ -39,18 +53,61 @@ structure Snapshot where
   from_ : Epoch
   /-- Claimants: live CLI sessions plus active Cowork sessions. -/
   sessions : Array SessionRec
-  /-- Best available window readings. -/
+  /-- Window readings that may be scheduled against. Expired readings are not here;
+  see `unknown` for the kinds they described. -/
   windows : List Window
-  /-- Provenance of the window readings. -/
+  /-- Kinds we have a reading for that is no longer evidence about the current window,
+  paired with that last reading. Reported, never planned against. -/
+  unknown : List Window
+  /-- Provenance of the window readings, pessimistically combined. -/
   prov : Provenance
-  /-- Age of the window readings, in seconds. `0` when unknown. -/
+  /-- Age of the freshest usable window reading, in seconds. `0` when unknown. -/
   readingAge : Nat
+  /-- Whether the statusline shim is present in `settings.json`. -/
+  sensorInstalled : Bool
+  /-- Whether any session has written a sample recently enough for the sensor to be
+  considered running. Distinct from `sensorInstalled`: a healthy sensor reporting a
+  payload with no `rate_limits` is live but yields no windows. -/
+  sensorLive : Bool
+  /-- Age of the newest sample of any kind, windows or not. `0` when there are none. -/
+  sensorAge : Nat
   deriving Inhabited
 
-/-- Latest sample per session, plus the newest sample overall. -/
+/-! ## Folding readings per window kind -/
+
+/-- The newest reading seen for each window kind. -/
+structure WindowView where
+  fiveHour : Option Window := none
+  sevenDay : Option Window := none
+  spendLimit : Option Window := none
+  deriving Repr, Inhabited
+
+/-- Keep `w` if it is newer than what we hold for its kind. Ties go to `w`, matching
+the append-only log's "later line wins" convention. -/
+def WindowView.bump (v : WindowView) (w : Window) : WindowView :=
+  let newer (o : Option Window) : Option Window :=
+    match o with
+    | some prev => if w.observedAt ≥ prev.observedAt then some w else some prev
+    | none => some w
+  match w.kind with
+  | .fiveHour => { v with fiveHour := newer v.fiveHour }
+  | .sevenDay => { v with sevenDay := newer v.sevenDay }
+  | .spendLimit => { v with spendLimit := newer v.spendLimit }
+
+def WindowView.ofList (ws : List Window) : WindowView :=
+  ws.foldl WindowView.bump {}
+
+/-- In a stable order, so output does not depend on log order. -/
+def WindowView.toList (v : WindowView) : List Window :=
+  v.fiveHour.toList ++ v.sevenDay.toList ++ v.spendLimit.toList
+
+/-- Newest sample timestamp, and the newest reading of each kind. -/
 structure SampleView where
-  bySession : Std.HashMap String Sample := {}
-  newest : Option Sample := none
+  windows : WindowView := {}
+  /-- Newest sample of any kind, including one carrying no window at all. That is the
+  sensor's heartbeat: it distinguishes "no shim installed" from "shim installed and
+  running, payload carries no `rate_limits`". -/
+  newestTs : Epoch := 0
   deriving Inhabited
 
 /-- Read the sensor log. -/
@@ -60,21 +117,32 @@ def loadSamples : IO SampleView := do
   let mut view : SampleView := {}
   for line in lines do
     if let some s := Ndjson.decodeSample line then
-      -- Keep the newest reading per session, and the newest overall.
-      match view.bySession.get? s.sessionId with
-      | some prev => if s.ts ≥ prev.ts then view := { view with bySession := view.bySession.insert s.sessionId s }
-      | none => view := { view with bySession := view.bySession.insert s.sessionId s }
-      match view.newest with
-      | some n => if s.ts ≥ n.ts then view := { view with newest := some s }
-      | none => view := { view with newest := some s }
+      view := { windows := s.windows.foldl WindowView.bump view.windows
+                newestTs := max view.newestTs s.ts }
   return view
+
+/-- Is the statusline shim installed?
+
+Read from `settings.json` rather than inferred from whether a reading happens to be
+fresh. Those are different questions, and conflating them told the agent to ask the
+user to install a sensor that was already installed and working. -/
+def sensorInstalled : IO Bool := do
+  let p ← Paths.settingsFile
+  if !(← p.pathExists) then return false
+  let txt ← try IO.FS.readFile p catch _ => pure ""
+  match J.parseLine txt with
+  | none => return false
+  | some j =>
+    let cmd := J.str j ["statusLine", "command"]
+    return (cmd.splitOn "stratify").length > 1
 
 /-- Take a full snapshot.
 
-`windowKind` selects the horizon used for token attribution — five hours by default.
+`horizon` selects the window used for token attribution — five hours by default.
 Sessions are enriched from their transcripts, which is the expensive step, so only
 sessions that are actually claimants get scanned. -/
-def snapshot (horizon : WindowKind := .fiveHour) : IO Snapshot := do
+def snapshot (g : Guards := Guards.default) (horizon : WindowKind := .fiveHour) :
+    IO Snapshot := do
   let now ← Time.nowEpoch
   let from_ := now - horizon.nominalSeconds
   -- CLI sessions: registry, then liveness, then transcript enrichment.
@@ -88,39 +156,37 @@ def snapshot (horizon : WindowKind := .fiveHour) : IO Snapshot := do
   let coworkLive := cowork.filter (·.session.alive)
   for c in coworkLive do
     enriched := enriched.push c.session
-  -- Window state, best source first.
+  -- Window state, best source first. Readings are folded per kind, not per sample:
+  -- a sample carrying only `seven_day` is silence about `five_hour`, not a zero.
   let samples ← loadSamples
-  let (windows, age) :=
-    match samples.newest with
-    | some s => (s.windows, now - s.ts)
-    | none =>
-      -- Newest Cowork reading, by observation time. Taking the last session's
-      -- windows instead would pick an arbitrary one, which on this machine meant a
-      -- fifteen-day-old record beating a recent one.
-      let best : List Window × Epoch :=
-        cowork.foldl (init := ([], 0)) fun (acc, accAt) (c : Cowork.CoworkSession) =>
-          let obsAt := c.windows.foldl (fun a (w : Window) => max a w.observedAt) 0
-          if c.windows.isEmpty || obsAt ≤ accAt then (acc, accAt) else (c.windows, obsAt)
-      match best with
-      | ([], _) => ([], 0)
-      | (ws, obsAt) => (ws, now - obsAt)
-  -- A reading older than the shortest window it describes is no longer an observation
-  -- of the current window — the window has since reset and we are inferring, not
-  -- measuring. Saying "measured" of a 358-hour-old record would be a false claim.
-  let prov :=
-    if windows.isEmpty then Provenance.unknown
-    else if age > WindowKind.fiveHour.nominalSeconds then Provenance.estimated
-    else Provenance.measured
-  -- Stamp it onto the windows themselves rather than only onto the snapshot.
-  -- `Sample.windows` tags every reading `measured` — true of the sample, but the
-  -- decision that matters is whether it is still a measurement *now*, and that is what
-  -- `prov` decides. Leaving the windows' own tag alone meant `plan` (which reports the
-  -- binding window's provenance) and `status --json`'s per-window field both announced
-  -- a six-hour-old reading as measured while the summary line said estimated. One
-  -- source of truth, downgraded once, here.
-  let windows := windows.map (fun w => { w with prov := prov })
+  let statusline := samples.windows
+  -- Cowork readings fill kinds the statusline has never covered, and lose to it
+  -- wherever both have one — `WindowView.bump` keeps whichever was observed later.
+  let coworkWindows : List Window :=
+    cowork.foldl (init := []) fun acc (c : Cowork.CoworkSession) => acc ++ c.windows
+  let view := coworkWindows.foldl WindowView.bump statusline
+  let all := view.toList
+  -- Each reading is judged against the window it actually describes, not against a
+  -- single snapshot-wide age. An expired reading is dropped rather than downgraded:
+  -- there is no honest number to report for a window whose replacement we have never
+  -- seen, and reporting the old one is what let a 97%-consumed window read as empty.
+  let stamp := fun (w : Window) =>
+    { w with prov := w.provAt g.staleAfter g.rolloverGrace now }
+  let windows := (all.filter (fun w => w.usable g.rolloverGrace now)).map stamp
+  let unknown := (all.filter (fun w => !w.usable g.rolloverGrace now)).map stamp
+  -- Freshest usable reading, which is what the header age refers to.
+  let age := match windows with
+    | [] => 0
+    | w :: rest => rest.foldl (fun a x => min a (now - x.observedAt)) (now - w.observedAt)
+  let prov := match windows with
+    | [] => Provenance.unknown
+    | w :: rest => rest.foldl (fun a x => Provenance.worst a x.prov) w.prov
+  let installed ← sensorInstalled
+  let sensorAge := if samples.newestTs == 0 then 0 else now - samples.newestTs
+  let sensorLive := samples.newestTs != 0 && sensorAge ≤ g.sensorLiveWithin
   return { now := now, from_ := from_, sessions := enriched
-           windows := windows, prov := prov, readingAge := age }
+           windows := windows, unknown := unknown, prov := prov, readingAge := age
+           sensorInstalled := installed, sensorLive := sensorLive, sensorAge := sensorAge }
 
 /-! ## Derived views -/
 

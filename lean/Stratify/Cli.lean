@@ -119,29 +119,50 @@ def record : IO UInt32 := do
     if let some j := J.parseLine input then
       let now ← Time.nowEpoch
       if let some s := sampleOfStatusline j now then
-        -- A sample with no window reading teaches us nothing and still costs a line.
-        if s.fiveHour.isSome || s.sevenDay.isSome || s.spendLimit.isSome then
-          Ndjson.append (← Paths.samplesFile) (Ndjson.encodeSample s)
+        -- Written even when the payload carries no window at all. An earlier version
+        -- skipped those, on the grounds that a sample with no reading teaches nothing.
+        -- It teaches the one thing that cannot be recovered any other way: that the
+        -- sensor ran, and saw no `rate_limits`.
+        --
+        -- Claude Code drops each window from the payload as its `resets_at` passes, so
+        -- once both windows lapse the payload is windowless and stays that way until a
+        -- fresh reading arrives. Skipping those renders froze the log — on this account
+        -- for over two hours — and left no way to tell a healthy sensor reporting
+        -- nothing from no sensor at all. `status` then advised installing a sensor that
+        -- was already installed and running.
+        Ndjson.append (← Paths.samplesFile) (Ndjson.encodeSample s)
   catch _ => pure ()
   return 0
 
 /-! ## status -/
 
-/-- Render one window line. -/
+/-- Short label for a window kind, padded to a common width. -/
+def kindLabel : WindowKind → String
+  | .fiveHour => "5h "
+  | .sevenDay => "7d "
+  | .spendLimit => "spend"
+
+/-- Render one usable window line. -/
 def windowLine (w : Window) (now : Epoch) : String :=
-  let name := match w.kind with
-    | .fiveHour => "5h "
-    | .sevenDay => "7d "
-    | .spendLimit => "spend"
+  let name := kindLabel w.kind
   if w.rolledOver now then
-    s!"  {name}  {pad (fmtPct w.used) 8} (window has reset; reading is stale)"
+    s!"  {name}  {pad (fmtPct w.used) 8} (just reset; treating the new window as empty)"
   else
     s!"  {name}  {pad (fmtPct w.used) 8} resets in {Time.humanDuration (w.secondsLeft now)}"
+
+/-- Render one window we can no longer speak for.
+
+The last reading is shown, but as history rather than as a number to act on: what it
+measured is a window that has since been replaced by one nobody has observed. -/
+def unknownWindowLine (w : Window) (now : Epoch) : String :=
+  let name := kindLabel w.kind
+  let ago := Time.humanDuration (now - w.resetsAt)
+  s!"  {name}  {pad "UNKNOWN" 8} (last read {fmtPct w.used} before this window reset {ago} ago)"
 
 /-- The human-readable report. -/
 def renderStatus (s : Collect.Snapshot) (home : String) : String := Id.run do
   let mut out := ""
-  if s.windows.isEmpty then
+  if s.windows.isEmpty && s.unknown.isEmpty then
     out := out ++ "Rate-limit windows: UNKNOWN — no sensor data.\n\n"
     out := out ++ "  `used %` and `resets_at` are not persisted anywhere on disk; they exist\n"
     out := out ++ "  only in the statusline payload. Until the sensor is installed, session\n"
@@ -153,6 +174,24 @@ def renderStatus (s : Collect.Snapshot) (home : String) : String := Id.run do
     out := out ++ (if s.readingAge > 0 then s!", {Time.humanDuration s.readingAge} old]\n" else "]\n")
     for w in s.windows do
       out := out ++ windowLine w s.now ++ "\n"
+    for w in s.unknown do
+      out := out ++ unknownWindowLine w s.now ++ "\n"
+    -- The case that reads as a broken tool unless it is spelled out: the sensor is
+    -- installed and firing, and still has nothing to report, because Claude Code drops
+    -- each window from the payload once its `resets_at` passes.
+    if s.windows.isEmpty then
+      out := out ++ "\n"
+      out := out ++ (if s.sensorLive then
+          s!"  The sensor is running (last render {Time.humanDuration s.sensorAge} ago) but the\n"
+        else if s.sensorInstalled then
+          s!"  The sensor is installed but has not rendered in {Time.humanDuration s.sensorAge}; the\n"
+        else
+          "  No sensor is installed, so the\n")
+      out := out ++ "  statusline payload is carrying no `rate_limits` at all. Claude Code drops a\n"
+      out := out ++ "  window from the payload once its reset time passes, and only restores it on a\n"
+      out := out ++ "  later API response. Until one arrives there is no reading to report, and\n"
+      out := out ++ "  `plan` will hand out one minimum sprint at a time rather than assume the\n"
+      out := out ++ "  window is empty.\n"
     out := out ++ "\n"
   let cliN := (s.sessions.filter (·.origin == .cli)).size
   let coN := (s.sessions.filter (·.origin == .cowork)).size
@@ -197,9 +236,17 @@ def statusJson (s : Collect.Snapshot) : Json :=
      ("window_from", Json.num (JsonNumber.fromNat s.from_)),
      ("provenance", Json.str (provLabel s.prov)),
      ("reading_age_seconds", Json.num (JsonNumber.fromNat s.readingAge)),
-     ("sensor_installed", Json.bool (s.prov.isMeasured)),
+     -- Three separate facts that used to be one. `sensor_installed` was derived from
+     -- provenance, so a healthy sensor reporting a windowless payload announced itself
+     -- as absent and the skill told the user to install it again.
+     ("sensor_installed", Json.bool s.sensorInstalled),
+     ("sensor_live", Json.bool s.sensorLive),
+     ("sensor_age_seconds", Json.num (JsonNumber.fromNat s.sensorAge)),
      ("claimants", Json.num (JsonNumber.fromNat s.sessions.size)),
      ("windows", Json.arr (s.windows.map winJson).toArray),
+     -- Kinds whose last reading described a window that has since been replaced.
+     -- Reported so the gap is visible, never scheduled against.
+     ("unknown_windows", Json.arr (s.unknown.map (fun w => Json.str w.kind.key)).toArray),
      ("sessions", Json.arr (s.sessions.map sessJson)),
      ("total_tokens_in_window", Json.num (JsonNumber.fromNat (Collect.totalTokens s)))]
 
@@ -267,7 +314,9 @@ def planJson (p : Plan) (snap : Collect.Snapshot) : Json :=
      ("minutes_left", Json.num (JsonNumber.fromNat (Time.toMinutes p.secondsLeft))),
      ("wait_for_reset", Json.bool p.waitForReset),
      ("provenance", Json.str (provLabel p.prov)),
-     ("sensor_installed", Json.bool snap.prov.isMeasured),
+     ("sensor_installed", Json.bool snap.sensorInstalled),
+     ("sensor_live", Json.bool snap.sensorLive),
+     ("unknown_windows", Json.arr (snap.unknown.map (fun w => Json.str w.kind.key)).toArray),
      ("resample_every_sprints", Json.num (JsonNumber.fromNat Guards.default.resampleEvery))]
 
 def renderPlan (p : Plan) : String :=
@@ -284,7 +333,11 @@ def renderPlan (p : Plan) : String :=
   let wr := if p.waitForReset then
       "\n  BUDGET EXHAUSTED — wait for the window to reset before the next sprint.\n"
     else ""
-  hdr ++ bind ++ cl ++ wt ++ gr ++ sb ++ sl ++ cr ++ lf ++ wr
+  let uk := if p.prov == .unknown then
+      "\n  WINDOW UNKNOWN — no current reading. This is one minimum sprint, not a\n"
+      ++ "  measured allowance. Re-run `stratify plan` after the next sprint.\n"
+    else ""
+  hdr ++ bind ++ cl ++ wt ++ gr ++ sb ++ sl ++ cr ++ lf ++ wr ++ uk
 
 def plan (args : List String) : IO UInt32 := do
   match ← resolveSessionId (flagValue args "--session") with

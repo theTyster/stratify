@@ -31,6 +31,26 @@ Check `sensor_installed` in any JSON output. If it is `false`:
 3. Ask before applying it. Applying means editing `~/.claude/settings.json`, which
    affects every Claude session, so it needs explicit permission.
 
+### A window can be UNKNOWN while the sensor is perfectly healthy
+
+Three fields, three different facts. Do not collapse them.
+
+| Field | What it means |
+|---|---|
+| `sensor_installed` | The statusline shim is in `settings.json`. Read from the file. |
+| `sensor_live` | Some session wrote a sample in the last two minutes. |
+| `unknown_windows` | Kinds whose last reading described a window that has since reset. |
+
+Claude Code drops a window from the statusline payload once its `resets_at` passes, and
+only restores it on a later API response. So a fully installed, currently running sensor
+can report no window at all — sometimes for hours. That is not a fault to fix and **not
+a reason to suggest reinstalling the sensor.** If `sensor_installed` is `true`, do not
+raise installation at all.
+
+When a kind appears in `unknown_windows`, say the window is unknown. Do not quote its
+last reading as the current figure — that number described a window that no longer
+exists.
+
 ## Workflow
 
 ### 1. Inspect the current state
@@ -60,10 +80,16 @@ Returns JSON, and defaults to the current session id.
 | `sleep_seconds` | How long to wait before the next sprint. |
 | `cron` | The same cadence as a cron expression. |
 | `wait_for_reset` | `true` means the budget is exhausted. Do not begin another sprint. |
-| `provenance` | `measured` = a real reading. `estimated` = inferred from a stale one. `UNKNOWN` = no data. |
+| `provenance` | `measured` = a live window, read recently. `estimated` = a live window read a while ago, or one that just reset. `UNKNOWN` = no current reading. |
 | `claimants` | How many sessions the window is split across. |
 
 Never present an `estimated` or `UNKNOWN` value as a measurement. Say which it is.
+
+**`provenance: "UNKNOWN"` is a real plan, not a failure.** It means no window could be
+read, so the grant is one minimum sprint (0.5 %) with the shortest legal sleep. Work the
+sprint, then re-run `stratify plan` — the small budget and short interval exist so the
+next reading is picked up quickly. Do not treat it as `wait_for_reset`, and do not
+substitute a larger budget because the last reading looked comfortable.
 
 ### 3. Set priority when the user requests it
 
