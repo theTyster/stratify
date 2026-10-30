@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>stratify · nice, for your Claude rate limit</title>
+<meta name="description" content="Stratify paces concurrent Claude sessions against the shared rate-limit window, so one burst can't starve the rest.">
+<style>
+:root{--bg:#0b0f14;--card:#0f1419;--line:#222b35;--fg:#e6edf3;--mute:#8b98a5;--green:#5eead4;--red:#ff6b6b;--amber:#fbbf24;--blue:#7aa2ff;
+--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--fg);font:17px/1.55 var(--sans);-webkit-font-smoothing:antialiased}
+main{max-width:1040px;margin:0 auto;padding:0 24px}
+section{padding:72px 0 0}
+h1{font-size:clamp(44px,8vw,88px);line-height:1;margin:0;letter-spacing:-.03em}
+h1 em{font-style:normal;color:var(--green)}
+h2{font-size:30px;margin:0 0 6px;letter-spacing:-.02em}
+.lede{color:var(--mute);margin:0 0 28px;max-width:640px}
+.hero{padding-top:96px}
+.hero p{font-size:21px;color:var(--mute);max-width:620px;margin:20px 0 28px}
+img.fig{display:block;width:100%;height:auto}
+code,pre{font-family:var(--mono)}
+.cmd{display:inline-flex;gap:10px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 14px;font:15px var(--mono);color:var(--fg)}
+.cmd b{color:var(--green);font-weight:400}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:28px;align-items:center}
+.two p{color:var(--mute);margin:0 0 14px}
+@media(max-width:760px){.two{grid-template-columns:1fr}}
+
+/* widget */
+.lab{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px}
+.ctl{display:grid;grid-template-columns:repeat(3,1fr);gap:22px;margin-bottom:22px}
+@media(max-width:760px){.ctl{grid-template-columns:1fr}}
+.ctl label{display:flex;justify-content:space-between;font:13px var(--mono);color:var(--mute);margin-bottom:6px}
+.ctl label span{color:var(--fg)}
+input[type=range]{width:100%;accent-color:var(--green)}
+.bar{display:flex;height:46px;border-radius:10px;overflow:hidden;border:1px solid var(--line);background:#161d26}
+.bar div{height:100%;transition:width .25s}
+.seg-used{background:#2b3541}
+.seg-other{background:#344a63;border-right:1px solid var(--card)}
+.seg-me{background:var(--green)}
+.seg-res{background:repeating-linear-gradient(45deg,#3d3213,#3d3213 6px,#2a230d 6px,#2a230d 12px)}
+.legend{display:flex;flex-wrap:wrap;gap:16px;font-size:13px;color:var(--mute);margin:10px 0 22px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+.tl{position:relative;height:46px;border-radius:10px;border:1px solid var(--line);background:#161d26;overflow:hidden}
+.tl div{position:absolute;top:8px;bottom:8px;border-radius:4px;background:var(--green);min-width:3px}
+.tl.stall{display:grid;place-items:center;color:var(--amber);font:14px var(--mono)}
+.axis{display:flex;justify-content:space-between;font:12px var(--mono);color:var(--mute);margin-top:6px}
+.read{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-top:22px}
+@media(max-width:760px){.read{grid-template-columns:repeat(2,1fr)}}
+.read div{border-left:2px solid var(--line);padding-left:12px}
+.read b{display:block;font:700 26px var(--mono);color:var(--green);letter-spacing:-.02em}
+.read small{color:var(--mute);font-size:13px}
+.note{font-size:13px;color:var(--mute);margin:16px 0 0}
+
+/* provenance */
+.prov{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+@media(max-width:760px){.prov{grid-template-columns:1fr}}
+.pc{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px}
+.pill{display:inline-block;font:700 13px var(--mono);padding:3px 10px;border-radius:99px;margin-bottom:10px}
+.pc p{margin:0;color:var(--mute);font-size:15px}
+.pc .gauge{height:8px;border-radius:99px;margin:12px 0 0;background:#161d26;overflow:hidden}
+.pc .gauge i{display:block;height:100%}
+
+/* proofs */
+.proofs{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+@media(max-width:900px){.proofs{grid-template-columns:repeat(2,1fr)}}
+.th{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
+.th .n{font:700 12px var(--mono);color:var(--green)}
+.th .t{font-weight:600;margin:4px 0 6px;font-size:15px}
+.th code{display:block;font-size:11.5px;color:var(--mute);word-break:break-all}
+.sq{font:14px var(--mono);color:var(--mute);margin-top:14px}
+.sq b{color:var(--green)}
+
+.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+@media(max-width:760px){.steps{grid-template-columns:1fr}}
+.step{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px}
+.step .n{font:700 13px var(--mono);color:var(--green)}
+.step pre{margin:10px 0 0;font-size:13px;color:var(--fg);white-space:pre-wrap;word-break:break-word}
+.step p{color:var(--mute);font-size:14px;margin:8px 0 0}
+footer{padding:72px 0 56px;color:var(--mute);font-size:14px}
+a{color:var(--blue)}
+</style>
+</head>
+<body>
+<main>
+
+<section class="hero">
+  <h1><em>nice</em>,<br>for your rate limit.</h1>
+  <p>Every Claude session you run draws on one shared window. Stratify tells each session how much of it to take, and when to come back.</p>
+  <span class="cmd"><b>$</b> stratify plan</span>
+</section>
+
+<section>
+  <h2>One burst, or many sprints</h2>
+  <p class="lede">Left: fourteen sessions all working at once. Right: the same sessions, each on a paced share.</p>
+  <img class="fig" src="assets/burn.svg" alt="Window usage over five hours, without and with stratify">
+</section>
+
+<section>
+  <h2>Try the allocator</h2>
+  <p class="lede">The same arithmetic the binary runs: floor division on a 1000-weight scale, 90% ceiling, 0.5% minimum sprint, 60 s to 1 h sleeps. Other sessions sit at nice 0.</p>
+  <div class="lab">
+    <div class="ctl">
+      <div><label>your niceness <span id="vNice"></span></label><input id="nice" type="range" min="-20" max="19" value="0"></div>
+      <div><label>sessions sharing <span id="vN"></span></label><input id="n" type="range" min="1" max="20" value="14"></div>
+      <div><label>window already used <span id="vUsed"></span></label><input id="used" type="range" min="0" max="100" value="37"></div>
+    </div>
+    <div class="bar" id="bar"></div>
+    <div class="legend">
+      <span><i style="background:#2b3541"></i>already used</span>
+      <span><i style="background:var(--green)"></i>your grant</span>
+      <span><i style="background:#344a63"></i>other sessions</span>
+      <span><i style="background:#5a4a14"></i>10% reserve</span>
+    </div>
+    <div class="tl" id="tl"></div>
+    <div class="axis"><span>now</span><span>window resets in 5h</span></div>
+    <div class="read">
+      <div><b id="rGrant"></b><small>your grant</small></div>
+      <div><b id="rSprints"></b><small>sprints</small></div>
+      <div><b id="rBudget"></b><small>per sprint</small></div>
+      <div><b id="rSleep"></b><small>between sprints</small></div>
+    </div>
+    <p class="note" id="note"></p>
+  </div>
+</section>
+
+<section>
+  <div class="two">
+    <div>
+      <h2>Nice, but gentler</h2>
+      <p>Same shape as Unix <code>nice</code>, with a 14.9× spread instead of the ~5900× of Linux CFS. A session that yields still makes steady progress; it doesn't stall.</p>
+      <p><span class="cmd"><b>$</b> stratify claim --nice 10</span></p>
+    </div>
+    <img class="fig" src="assets/terminal.svg" alt="Real output of stratify status and stratify plan">
+  </div>
+</section>
+
+<section>
+  <img class="fig" src="assets/share.svg" alt="Scheduling weight for each niceness from -20 to 19">
+</section>
+
+<section>
+  <h2>It says how sure it is</h2>
+  <p class="lede">Window usage only exists in the statusline payload, so every plan carries a label. The skill must pass it on, never present a guess as a reading.</p>
+  <div class="prov">
+    <div class="pc"><span class="pill" style="background:#12332f;color:var(--green)">measured</span><p>A live window, read recently.</p><div class="gauge"><i style="width:100%;background:var(--green)"></i></div></div>
+    <div class="pc"><span class="pill" style="background:#3d3213;color:var(--amber)">estimated</span><p>A live window read a while ago, or one that just reset.</p><div class="gauge"><i style="width:60%;background:var(--amber)"></i></div></div>
+    <div class="pc"><span class="pill" style="background:#3a1a1a;color:var(--red)">UNKNOWN</span><p>No current reading. You get one minimum sprint at a slow cadence, never a full grant.</p><div class="gauge"><i style="width:8%;background:var(--red)"></i></div></div>
+  </div>
+</section>
+
+<section>
+  <h2>Proved, not promised</h2>
+  <p class="lede">The allocator is written in Lean 4 with exact integer arithmetic. These are theorems the compiler checks.</p>
+  <div class="proofs">
+    <div class="th"><div class="n">1</div><div class="t">No oversubscription</div><code>grants_le_budget</code></div>
+    <div class="th"><div class="n">2</div><div class="t">Priority never hurts</div><code>grant_mono</code></div>
+    <div class="th"><div class="n">3</div><div class="t">Fair share gets a grant</div><code>grant_pos</code></div>
+    <div class="th"><div class="n">4</div><div class="t">Sleep stays in bounds</div><code>sleepFor_bounds</code></div>
+    <div class="th"><div class="n">4b</div><div class="t">Sprints fit the grant</div><code>sprint_schedule_within_grant</code></div>
+    <div class="th"><div class="n">6</div><div class="t">Safe across a reset</div><code>budgetOf_rolledOver</code></div>
+    <div class="th"><div class="n">7</div><div class="t">Blind means bounded</div><code>unknown_is_bounded</code><code>unknownSleep_mono</code></div>
+    <div class="th"><div class="n">8</div><div class="t">Expired is not evidence</div><code>expired_not_measured</code></div>
+  </div>
+  <div class="sq"><b>∑</b> grants ≤ budget &nbsp;·&nbsp; the floor division's leftover pays for it</div>
+</section>
+
+<section>
+  <h2>Three steps</h2>
+  <p class="lede">Only the last one touches your settings, and it asks first.</p>
+  <div class="steps">
+    <div class="step"><div class="n">1 · build</div><pre>make install</pre><p>Builds the binary from source with the pinned Lean toolchain.</p></div>
+    <div class="step"><div class="n">2 · sense</div><pre>stratify install-sensor</pre><p>Prints the statusline change. Modifies nothing until you apply it.</p></div>
+    <div class="step"><div class="n">3 · pace</div><pre>stratify plan</pre><p>Or ask Claude to work in stratified sprints, and the skill takes over.</p></div>
+  </div>
+</section>
+
+<footer>stratify 0.1.0 · a Claude Code plugin · <a href="https://github.com/thetyster/stratify">source</a></footer>
+</main>
+
+<script>
+// Same tables and guards as lean/Stratify/Allocate.lean and Types.lean.
+const W=[4000,3732,3482,3249,3031,2828,2639,2462,2297,2144,2000,1866,1741,1625,1516,1414,1320,1231,1149,1072,
+         1000,933,871,812,758,707,660,616,574,536,500,467,435,406,379,354,330,308,287,268];
+const CEIL=90000, MIN_SPRINT=500, MIN_SLEEP=60, MAX_SLEEP=3600, RUNWAY=18000;
+const $=id=>document.getElementById(id);
+const pct=m=>(m/1000).toFixed(1)+"%";
+const dur=s=>s>=3600?(s/3600)+" h":s>=60?Math.round(s/60)+" min":s+" s";
+
+function render(){
+  const nice=+$("nice").value, n=+$("n").value, usedPct=+$("used").value;
+  $("vNice").textContent=nice; $("vN").textContent=n; $("vUsed").textContent=usedPct+"%";
+  const mine=W[nice+20], total=mine+(n-1)*1000;
+  const used=usedPct*1000;
+  const budget=Math.max(0, CEIL-used);                 // headroom under the ceiling
+  const grant=Math.floor(budget*mine/total);
+  const others=Math.floor(budget*(n-1)*1000/total);
+  const sprints=Math.max(1,Math.floor(grant/MIN_SPRINT));
+  const per=Math.floor(grant/sprints);
+  const sleep=grant===0?MAX_SLEEP:Math.max(MIN_SLEEP,Math.min(MAX_SLEEP,Math.floor(RUNWAY/sprints)));
+  const seg=(c,v)=>`<div class="${c}" style="width:${v/1000}%"></div>`;
+  $("bar").innerHTML=seg("seg-used",Math.min(used,100000))+seg("seg-me",grant)+seg("seg-other",others)+
+    seg("seg-res",Math.max(0,100000-Math.min(used,100000)-grant-others));
+  const tl=$("tl");
+  if(grant===0){
+    tl.className="tl stall"; tl.innerHTML="wait for reset";
+  }else{
+    tl.className="tl";
+    let h="";
+    for(let i=0;i<sprints;i++){
+      const left=(i*RUNWAY/sprints)/RUNWAY*100;
+      const w=Math.max(0.4,per/MIN_SPRINT*0.6);  // tick width, for show
+      h+=`<div style="left:${left}%;width:${Math.min(w,100/sprints-0.3)}%"></div>`;
+    }
+    tl.innerHTML=h;
+  }
+  $("rGrant").textContent=pct(grant); $("rSprints").textContent=grant===0?"0":sprints;
+  $("rBudget").textContent=pct(per); $("rSleep").textContent=dur(sleep);
+  $("note").textContent=grant===0
+    ? "Your fair share rounds to nothing. Stratify says wait for the reset instead of inventing a grant."
+    : "";
+}
+["nice","n","used"].forEach(i=>$(i).addEventListener("input",render));
+render();
+</script>
+</body>
+</html>
