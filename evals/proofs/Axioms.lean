@@ -288,6 +288,23 @@ def agentDecl : Ledger.Entry :=
 -- visible in the emitted plan rather than absorbed.
 example : niceWeight (Nice.ofInt (-5)) ≠ niceWeight (Nice.ofInt 10) := by decide
 
+/-! ## 9. Accounts — the separation is real, and the hypothesis is satisfiable
+
+Two keys whose fresh readings disagree are split apart, so `claimantsOf` really does
+exclude someone; and the window's actual users in that fixture do pairwise share, so
+`window_not_oversubscribed` is not vacuously true of it. -/
+
+private def ev9 : Pool.Evidence :=
+  { marks := [⟨"a", .fiveHour, 1000⟩, ⟨"b", .fiveHour, 9000⟩] }
+private def cs9 : List Pool.Claimant := [⟨"a", 1000⟩, ⟨"b", 1000⟩, ⟨"", 1000⟩, ⟨"a", 500⟩]
+private def users9 : List Pool.Claimant := [⟨"a", 1000⟩, ⟨"", 1000⟩, ⟨"a", 500⟩]
+
+#guard (Pool.claimantsOf ev9 "a" cs9).length == 3
+#guard (Pool.claimantsOf ev9 "b" cs9).length == 2
+#guard users9.all fun s => users9.all fun t => Pool.mayShare ev9 s.key t.key
+-- And without the readings, nothing separates them.
+#guard (Pool.claimantsOf {} "a" cs9).length == 4
+
 /-! ## Axiom footing
 
 One line per property. `run-checks.sh` asserts the count, the absence of `sorryAx`, and
@@ -323,5 +340,12 @@ that nothing outside Lean's standard three axioms appears. -/
 #print axioms Stratify.state_expired_of_long_past
 #print axioms Stratify.expired_not_measured
 #print axioms Stratify.expired_not_usable
+-- 9. However accounts are split, no window is oversubscribed; agreeing readings never
+-- split a window.
+#print axioms Stratify.Pool.window_not_oversubscribed
+#print axioms Stratify.Pool.grants_le_budget_of_covering
+#print axioms Stratify.Pool.readings_that_agree_do_not_separate
+#print axioms Stratify.Pool.mayShare_unattributed_left
+#print axioms Stratify.Pool.mayShare_unattributed_right
 
 end Stratify.Evals

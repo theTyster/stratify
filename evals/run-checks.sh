@@ -224,7 +224,7 @@ section "Axiom hygiene and non-vacuity"
 if (cd "$LEAN" && lake env lean "$REPO/evals/proofs/Axioms.lean" >"$WORK/axioms.log" 2>&1); then
   ok "evals/proofs/Axioms.lean elaborates (non-vacuity witnesses hold)"
   n_thms=$(grep -c 'depends on axioms' "$WORK/axioms.log" | tr -d ' ')
-  chk "all twenty properties reported an axiom set" "$n_thms" "20"
+  chk "all twenty-five properties reported an axiom set" "$n_thms" "25"
   if grep -q 'sorryAx' "$WORK/axioms.log"; then
     bad "no sorryAx" "$(grep sorryAx "$WORK/axioms.log")"
   else
@@ -540,14 +540,16 @@ if [ -r /proc/self/environ ]; then
     p=${pair%%:*}; rest=${pair#*:}; sid=${rest%%:*}; nm=${rest#*:}
     mkreg "$EA" "$p" "$sid" "$nm" "busy" "$(ps -o lstart= -p "$p" | sed -E 's/^ +//; s/ +$//')"
   done
-  mkpayload "$SA" "seven_day:20:$((NOW + 86400))" | sx "$EA" record >/dev/null
-  mkpayload "$SB" "seven_day:80:$((NOW + 86400))" | sx "$EA" record >/dev/null
+  # A and B report different 7-day reset times: two windows, proven by measurement.
+  # C is a login that has never produced a reading: nothing proves it apart from anyone.
+  mkpayload "$SA" "seven_day:20:$((NOW + 86400))"  | sx "$EA" record >/dev/null
+  mkpayload "$SB" "seven_day:80:$((NOW + 172800))" | sx "$EA" record >/dev/null
 
   sx "$EA" plan --session "$SA" >"$EA/plan.json" 2>/dev/null
-  chk "a session splits only with its own account" "$(jget claimants <"$EA/plan.json")" "1"
-  chk "and plans against its own account's reading" "$(jget grant_mpp <"$EA/plan.json")" "70000"
+  chk "readings that disagree split two accounts apart" "$(jget claimants <"$EA/plan.json")" "2"
+  chk "and an account with no proof still shares (70000 / 2)" "$(jget grant_mpp <"$EA/plan.json")" "35000"
   sx "$EA" plan --session "$SB" >"$EA/plan.json" 2>/dev/null
-  chk "the other account sees its own window" "$(jget grant_mpp <"$EA/plan.json")" "10000"
+  chk "the other account plans against its own window (10000 / 2)" "$(jget grant_mpp <"$EA/plan.json")" "5000"
 
   sx "$EA" status --json >"$EA/status.json" 2>/dev/null
   chk "a login with no env credential is labelled by its email" \
@@ -560,10 +562,42 @@ print([s.get("account") for s in d["sessions"] if s["session_id"].endswith("c")]
     bad "no credential is written or printed" "found eval-secret in state or status output"
   else ok "no credential is written or printed"; fi
 
-  # Accounts are remembered, so a reading keeps its account after its session exits.
+  # The operator can declare an account independent; an agent-facing default cannot.
+  sx "$EA" account --session "$SC" --independent >/dev/null 2>&1
+  sx "$EA" plan --session "$SA" >"$EA/plan.json" 2>/dev/null
+  chk "a declared-independent account leaves the split" "$(jget claimants <"$EA/plan.json")" "1"
+  chk "and the grant grows to match" "$(jget grant_mpp <"$EA/plan.json")" "70000"
+  cp -r "$EA/state" "$EA/state-gc"
+  env -u CLAUDE_CODE_SESSION_ID HOME="$EA/home" STRATIFY_HOME="$EA/state-gc" "$BIN" gc --days 0 >/dev/null 2>&1
+  if grep -q '"ind":true' "$EA/state-gc/accounts.ndjson" 2>/dev/null; then ok "gc keeps the declaration"
+  else bad "gc keeps the declaration" "no independence record left after gc --days 0"; fi
+  sx "$EA" account --session "$SC" --shared >/dev/null 2>&1
+  sx "$EA" plan --session "$SA" >"$EA/plan.json" 2>/dev/null
+  chk "--shared withdraws it" "$(jget claimants <"$EA/plan.json")" "2"
+  sx "$EA" account --session "$SC" --independent >/dev/null 2>&1
+
+  # A reading keeps its account after its session exits. If it lost it, A's 20% reading
+  # would land in B's view and hand B a 70% grant against an 80%-used window.
   kill "$PA" 2>/dev/null; sleep 0.2
   sx "$EA" plan --session "$SB" >"$EA/plan.json" 2>/dev/null
   chk "a departed session's reading stays with its account" "$(jget grant_mpp <"$EA/plan.json")" "10000"
+
+  # Two credentials whose readings agree are one window as far as anyone can tell, and
+  # must split it. This is the case of one subscription reached two ways.
+  ES=$(new_env samewindow)
+  spawn_stub_env "$ES" a HOME="$ES/home" CLAUDE_CODE_OAUTH_TOKEN=eval-token-a; QA="$STUB_PID"
+  spawn_stub_env "$ES" b HOME="$ES/home" ANTHROPIC_API_KEY=eval-token-b;       QB="$STUB_PID"
+  sleep 0.4
+  mkreg "$ES" "$QA" "$SA" "same-a" "busy" "$(ps -o lstart= -p "$QA" | sed -E 's/^ +//; s/ +$//')"
+  mkreg "$ES" "$QB" "$SB" "same-b" "busy" "$(ps -o lstart= -p "$QB" | sed -E 's/^ +//; s/ +$//')"
+  mkpayload "$SA" "five_hour:40:$((NOW + 7200))" | sx "$ES" record >/dev/null
+  mkpayload "$SB" "five_hour:40:$((NOW + 7200))" | sx "$ES" record >/dev/null
+  sx "$ES" plan --session "$SA" >"$ES/plan.json" 2>/dev/null
+  chk "two credentials on one window share it" "$(jget claimants <"$ES/plan.json")" "2"
+  # And with no readings at all, different credentials still share.
+  : >"$ES/state/samples.ndjson"
+  sx "$ES" plan --session "$SA" >"$ES/plan.json" 2>/dev/null
+  chk "different credentials without proof share" "$(jget claimants <"$ES/plan.json")" "2"
 else
   ok "accounts: skipped, no /proc on this platform (no account is reported there)"
 fi

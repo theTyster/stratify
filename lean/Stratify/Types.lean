@@ -416,6 +416,12 @@ structure Guards where
   seconds. Past this, silence means the replacement window is being spent into
   unobserved — which is a different fact, and the one that matters. -/
   rolloverGrace : Nat := 300
+  /-- How recent a reading must be to count as evidence that two accounts are on
+  different windows. Short, because a reading of a window that has since been replaced
+  early would otherwise keep two halves of one window apart. -/
+  apartWithin : Nat := 15 * 60
+  /-- Reset times closer than this are one window. -/
+  apartGap : Nat := 300
   /-- How recently the sensor must have written for it to count as live.
 
   Eight times the installed `refreshInterval` of 15 s, so an ordinary gap between

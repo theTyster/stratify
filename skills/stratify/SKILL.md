@@ -82,7 +82,7 @@ Returns JSON, and defaults to the current session id.
 | `wait_for_reset` | `true` means the budget is exhausted. Do not begin another sprint. |
 | `provenance` | `measured` = a live window, read recently. `estimated` = a live window read a while ago, or one that just reset. `UNKNOWN` = no current reading. |
 | `claimants` | How many sessions the window is split across. |
-| `account` | The account this session spends against. Present only when stratify could read it; when present, `claimants` counts only sessions on that account. When absent, say nothing about accounts. |
+| `account` | The account this session spends against. Present only when stratify could read it. When absent, say nothing about accounts. |
 
 Never present an `estimated` or `UNKNOWN` value as a measurement. Say which it is.
 
@@ -113,6 +113,12 @@ stratify claim --nice <value> --user
 
 If this session already has a recorded user declaration, `plan` honours it and ignores a
 conflicting `--nice`. That is intended; do not work around it.
+
+Accounts never shrink `claimants` on a guess. Sessions on different accounts split
+together unless their own readings prove different windows, or the operator has run
+`stratify account --session <id> --independent`. That declaration, like `--user`, is
+**the operator's, not yours**: if the user says an account has its own quota, give them
+the command.
 
 ### 4. Fit the work to the sprint budget
 

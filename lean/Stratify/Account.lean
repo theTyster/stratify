@@ -193,6 +193,30 @@ def remember (now : Epoch) (known : Std.HashMap String Account)
         Ndjson.append path (encodeEntry now sid a)
   catch _ => pure ()
 
+/-! ## Independence declarations
+
+An operator's statement that an account draws on a window no other account shares — an
+API key billed per token, a gateway with its own quota. Nothing on the machine can
+verify that, which is why it is a declaration and why `Pool` otherwise refuses to
+separate accounts without measured proof. Stored in the same file, last line per key
+winning. -/
+
+def encodeIndependence (ts : Epoch) (key : String) (independent : Bool) : String :=
+  (Json.mkObj [("t", Json.num (JsonNumber.fromNat ts)), ("k", Json.str key),
+               ("ind", Json.bool independent)]).compress
+
+/-- Keys currently declared independent. -/
+def loadIndependent : IO (List String) := do
+  let mut m : Std.HashMap String Bool := {}
+  for line in ← Ndjson.readAll (← Paths.accountsFile) do
+    if let some j := J.parseLine line then
+      if let (some k, some b) := (J.str? j ["k"], (J.path? j ["ind"]).bind (·.getBool?.toOption)) then
+        m := m.insert k b
+  return m.toList.filterMap fun (k, b) => if b then some k else none
+
+def declareIndependence (ts : Epoch) (key : String) (independent : Bool) : IO Unit := do
+  Ndjson.append (← Paths.accountsFile) (encodeIndependence ts key independent)
+
 /-! ## Checks -/
 
 private def aLogin : Login := { account := "u-1", org := "o-1", email := "me@example.com" }

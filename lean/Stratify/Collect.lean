@@ -7,6 +7,7 @@ import Stratify.Sessions
 import Stratify.Transcript
 import Stratify.Cowork
 import Stratify.Account
+import Stratify.Pool
 import Stratify.Allocate
 
 /-!
@@ -78,6 +79,8 @@ structure Snapshot where
   readings : List (String × Window) := []
   /-- Account key to label, for every account seen. -/
   labels : List (String × String) := []
+  /-- What separates one account's split from another's. See `Pool.lean`. -/
+  evidence : Pool.Evidence := {}
   deriving Inhabited
 
 /-! ## Folding readings per window kind -/
@@ -218,13 +221,21 @@ def snapshot (g : Guards := Guards.default) (horizon : WindowKind := .fiveHour) 
   let labels : List (String × String) :=
     (accounts.toList.map (fun (_, a) => (a.key, a.label))
       ++ (cowork.filterMap (fun c => c.session.account.map fun a => (a.key, a.label))).toList)
+  -- Evidence that two accounts are on different windows: only readings fresh enough to
+  -- describe the window that exists now, plus the operator's declarations.
+  let marks : List Pool.Mark := readings.filterMap fun (k, w) =>
+    if k != "" && now < w.resetsAt && now - w.observedAt ≤ g.apartWithin then
+      some { key := k, kind := w.kind, resetsAt := w.resetsAt }
+    else none
+  let evidence : Pool.Evidence :=
+    { marks := marks, independent := ← Account.loadIndependent, gap := g.apartGap }
   let installed ← sensorInstalled
   let sensorAge := if samples.newestTs == 0 then 0 else now - samples.newestTs
   let sensorLive := samples.newestTs != 0 && sensorAge ≤ g.sensorLiveWithin
   return { now := now, from_ := from_, sessions := enriched
            windows := j.windows, unknown := j.unknown, prov := j.prov, readingAge := j.readingAge
            sensorInstalled := installed, sensorLive := sensorLive, sensorAge := sensorAge
-           readings := readings, labels := labels }
+           readings := readings, labels := labels, evidence := evidence }
 
 /-! ## Derived views -/
 
@@ -237,15 +248,16 @@ exactly as before accounts were tracked. -/
 def Snapshot.anyAccount (s : Snapshot) : Bool :=
   s.sessions.any (·.account.isSome) || s.readings.any (·.1 != "")
 
-/-- The snapshot as one account sees it: its own sessions and readings, plus every
-session and reading whose account is not known. Those stay in on purpose — dropping a
-claimant on a guess would hand out window that may already be spoken for. -/
+/-- A session's account key, `""` when not known. -/
+def acctKey (r : SessionRec) : String := (r.account.map (·.key)).getD ""
+
+/-- The snapshot as one account sees it: every session and reading not proven to be on
+a different window (`Pool.mayShare`). Different credentials alone are not proof, and
+neither is a missing account — dropping a claimant on a guess would hand out window
+that may already be spoken for. -/
 def Snapshot.scope (g : Guards) (s : Snapshot) (key : String) : Snapshot :=
-  let sessions := s.sessions.filter fun r =>
-    match r.account with
-    | none => true
-    | some a => a.key == key
-  let j := judgeReadings g s.now (s.readings.filter fun (k, _) => k == "" || k == key)
+  let sessions := s.sessions.filter fun r => Pool.mayShare s.evidence key (acctKey r)
+  let j := judgeReadings g s.now (s.readings.filter fun (k, _) => Pool.mayShare s.evidence key k)
   { s with sessions := sessions, windows := j.windows, unknown := j.unknown
            prov := j.prov, readingAge := j.readingAge }
 

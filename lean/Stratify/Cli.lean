@@ -415,6 +415,37 @@ def claim (args : List String) : IO UInt32 := do
       IO.println s!"stratify: {sid} nice={clamped.val} ({source.toString}), weight {niceWeight clamped}/1000"
       return 0
 
+/-! ## account -/
+
+/-- `stratify account --session <id> --independent | --shared`
+
+Declares that the account a session runs on draws on a window no other account shares,
+or withdraws that. Without a declaration, accounts are only split apart when their own
+readings prove they are on different windows (`Pool.lean`). -/
+def account (args : List String) : IO UInt32 := do
+  let ind := hasFlag args "--independent"
+  let shared := hasFlag args "--shared"
+  if ind == shared then
+    IO.eprintln "stratify: account needs exactly one of --independent or --shared"
+    return 2
+  match ← resolveSessionId (flagValue args "--session") with
+  | none =>
+    IO.eprintln "stratify: no session id (pass --session, or run inside a Claude session)"
+    return 2
+  | some sid =>
+    let snap ← Collect.snapshot
+    match (snap.sessions.find? (·.sessionId == sid)).bind (·.account) with
+    | none =>
+      IO.eprintln s!"stratify: the account of {sid} cannot be read, so there is nothing to declare"
+      return 2
+    | some a =>
+      Account.declareIndependence (← Time.nowEpoch) a.key ind
+      if ind then
+        IO.println s!"stratify: {a.label} is now planned as its own window. Every session on it\nsplits only with the others on it. If it in fact shares a window with another\naccount, that window will be overspent: undo with --shared."
+      else
+        IO.println s!"stratify: {a.label} shares splits again unless its readings prove otherwise."
+      return 0
+
 /-! ## gc -/
 
 def gc (args : List String) : IO UInt32 := do
@@ -440,10 +471,12 @@ def gc (args : List String) : IO UInt32 := do
   let apath ← Paths.accountsFile
   if ← apath.pathExists then
     let lines ← Ndjson.readAll apath
+    -- Independence declarations are kept at any age: they are the operator's standing
+    -- statement, and dropping one would silently merge two accounts' splits.
     let kept := lines.toList.filter fun l =>
       match Account.decodeEntry l with
       | some (t, _, _) => t ≥ cutoff
-      | none => false
+      | none => (J.parseLine l).any fun j => (J.path? j ["ind"]).isSome
     if kept.length < lines.size then
       let tmp := apath.withExtension "ndjson.tmp"
       IO.FS.writeFile tmp (String.intercalate "\n" kept ++ "\n")
@@ -465,6 +498,11 @@ USAGE
   stratify plan --session <id> [--nice N]
                                        This session's share and the interval to wait
                                        between sprints.
+  stratify account --session <id> --independent | --shared
+                                       Operator only. Declare that the session's account
+                                       draws on a window no other account shares, or undo
+                                       that. Without it, accounts split together unless
+                                       their readings prove different windows.
   stratify gc [--days N]               Drop log records older than N days (default 8).
   stratify install-sensor              Print the settings.json change that installs the
                                        statusline sensor. Does not modify anything.

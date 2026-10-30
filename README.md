@@ -24,9 +24,14 @@ stratify claim --nice -5    # take a larger share
 
 ## One machine, several accounts
 
-Sessions on different accounts don't share a window, so they don't share a split. On Linux, stratify reads which credential each session was started with (from its process environment, or else its config directory's login) and plans each account separately. `status` adds an `ACCOUNT` column when it knows.
+On Linux, stratify reads which credential each session was started with (from its process environment, or else its config directory's login), and `status` adds an `ACCOUNT` column when it knows. Credentials are hashed in memory; only a short fingerprint like `api key ·3f2a` is kept or shown.
 
-Credentials are hashed in memory. Only a short fingerprint like `api key ·3f2a` is ever kept or shown. Where an account can't be read, the session counts toward every split, as before.
+A different credential is not proof of a different window: one subscription can be reached through several. So accounts split **together** unless:
+
+- their own fresh readings show different reset times for the same window, or
+- you declare one independent: `stratify account --session <id> --independent` (undo with `--shared`).
+
+Without proof, sessions share, which can only slow them down. `window_not_oversubscribed` in [`lean/Stratify/Pool.lean`](lean/Stratify/Pool.lean) proves that no window is oversubscribed, however accounts are split.
 
 ## It says how sure it is
 
@@ -50,6 +55,7 @@ The allocator is Lean 4 with exact integer arithmetic ([`lean/Stratify/Allocate.
 | 6 | `budgetOf_rolledOver` | A window reset is safe |
 | 7 | `unknown_is_bounded` | No reading means a bounded grant, not a full one |
 | 8 | `expired_not_measured` | A reading from a past window is never called a measurement |
+| 9 | `window_not_oversubscribed` | However accounts are split, no window's grants exceed its budget |
 
 ## Install
 

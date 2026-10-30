@@ -12,6 +12,7 @@ def main (args : List String) : IO UInt32 := do
     | "status" => status (hasFlag rest "--json")
     | "plan" => plan rest
     | "claim" => claim rest
+    | "account" => account rest
     | "gc" => gc rest
     | "install-sensor" => installSensor
     | "help" | "--help" | "-h" => IO.print usage; return 0
