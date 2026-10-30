@@ -82,6 +82,7 @@ Returns JSON, and defaults to the current session id.
 | `wait_for_reset` | `true` means the budget is exhausted. Do not begin another sprint. |
 | `provenance` | `measured` = a live window, read recently. `estimated` = a live window read a while ago, or one that just reset. `UNKNOWN` = no current reading. |
 | `claimants` | How many sessions the window is split across. |
+| `account` | The account this session spends against. Present only when stratify could read it; when present, `claimants` counts only sessions on that account. When absent, say nothing about accounts. |
 
 Never present an `estimated` or `UNKNOWN` value as a measurement. Say which it is.
 

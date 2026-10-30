@@ -237,6 +237,15 @@ def TokenTally.empty : TokenTally := {}
 def TokenTally.total (t : TokenTally) : Tokens :=
   t.input + t.output + t.cacheCreation + t.cacheRead
 
+/-- The account a session spends against, when it could be read directly. See
+`Account.lean` for what counts as read directly; anything less is no account at all. -/
+structure Account where
+  /-- Stable, comparable, and safe to store: never contains a credential. -/
+  key : String
+  /-- For people: an email, or the credential kind and a short fingerprint. -/
+  label : String
+  deriving Repr, DecidableEq, Inhabited
+
 /-- One live session and what is known about it. -/
 structure SessionRec where
   origin : Origin
@@ -262,6 +271,8 @@ structure SessionRec where
   tally : TokenTally
   /-- Last activity seen for this session, epoch seconds. -/
   lastActivity : Epoch
+  /-- `none` whenever the account could not be read directly. -/
+  account : Option Account := none
   deriving Repr, Inhabited
 
 /-! ## Priority

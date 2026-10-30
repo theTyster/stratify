@@ -508,6 +508,77 @@ sx "$E" status --json >"$E/status.json" 2>/dev/null
 chk "an unprobeable registry fails safe to all-alive" "$(jget claimants <"$E/status.json")" "4"
 
 # ---------------------------------------------------------------------------
+section "Accounts: only sessions on the same account share a window"
+# ---------------------------------------------------------------------------
+
+# Own fixture variables (EA, EN): the next section reuses $E from the one before.
+
+# A stub like spawn_stub, started with exactly the environment given, so its
+# /proc/<pid>/environ says which credential it was "started" with.
+spawn_stub_env() {
+  local root="$1" n="$2"; shift 2
+  local path="$root/bin/claude-eval-stub-$n"
+  ln -sf /bin/sleep "$path"
+  env -i "$@" "$path" 120 >/dev/null 2>&1 &
+  STUB_PID=$!
+  STUB_PIDS="$STUB_PIDS $STUB_PID"
+  disown "$STUB_PID" 2>/dev/null || true
+}
+
+if [ -r /proc/self/environ ]; then
+  EA=$(new_env accounts)
+  printf '{"oauthAccount":{"accountUuid":"u-1","organizationUuid":"o-1","emailAddress":"login@example.com"}}' \
+    >"$EA/home/.claude.json"
+  SA="dddddddd-0000-4000-8000-00000000000a"
+  SB="dddddddd-0000-4000-8000-00000000000b"
+  SC="dddddddd-0000-4000-8000-00000000000c"
+  spawn_stub_env "$EA" a HOME="$EA/home" ANTHROPIC_API_KEY=eval-secret-a; PA="$STUB_PID"
+  spawn_stub_env "$EA" b HOME="$EA/home" ANTHROPIC_API_KEY=eval-secret-b; PB="$STUB_PID"
+  spawn_stub_env "$EA" c HOME="$EA/home";                                PC="$STUB_PID"
+  sleep 0.4
+  for pair in "$PA:$SA:acct-a" "$PB:$SB:acct-b" "$PC:$SC:acct-c"; do
+    p=${pair%%:*}; rest=${pair#*:}; sid=${rest%%:*}; nm=${rest#*:}
+    mkreg "$EA" "$p" "$sid" "$nm" "busy" "$(ps -o lstart= -p "$p" | sed -E 's/^ +//; s/ +$//')"
+  done
+  mkpayload "$SA" "seven_day:20:$((NOW + 86400))" | sx "$EA" record >/dev/null
+  mkpayload "$SB" "seven_day:80:$((NOW + 86400))" | sx "$EA" record >/dev/null
+
+  sx "$EA" plan --session "$SA" >"$EA/plan.json" 2>/dev/null
+  chk "a session splits only with its own account" "$(jget claimants <"$EA/plan.json")" "1"
+  chk "and plans against its own account's reading" "$(jget grant_mpp <"$EA/plan.json")" "70000"
+  sx "$EA" plan --session "$SB" >"$EA/plan.json" 2>/dev/null
+  chk "the other account sees its own window" "$(jget grant_mpp <"$EA/plan.json")" "10000"
+
+  sx "$EA" status --json >"$EA/status.json" 2>/dev/null
+  chk "a login with no env credential is labelled by its email" \
+    "$(python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print([s.get("account") for s in d["sessions"] if s["session_id"].endswith("c")][0])' <"$EA/status.json")" \
+    "login@example.com"
+  if grep -rq "eval-secret" "$EA/state" "$EA/status.json"; then
+    bad "no credential is written or printed" "found eval-secret in state or status output"
+  else ok "no credential is written or printed"; fi
+
+  # Accounts are remembered, so a reading keeps its account after its session exits.
+  kill "$PA" 2>/dev/null; sleep 0.2
+  sx "$EA" plan --session "$SB" >"$EA/plan.json" 2>/dev/null
+  chk "a departed session's reading stays with its account" "$(jget grant_mpp <"$EA/plan.json")" "10000"
+else
+  ok "accounts: skipped, no /proc on this platform (no account is reported there)"
+fi
+
+# Nothing known about accounts means no account field at all — not an "unknown" one.
+EN=$(new_env noaccount)
+mkpayload "$SID" "five_hour:41.2:$((NOW + 14400))" | sx "$EN" record >/dev/null 2>&1
+sx "$EN" status --json >"$EN/status.json" 2>/dev/null
+chk "with no account known, status carries no account data" \
+  "$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["accounts"], any("account" in s for s in d["sessions"]))' <"$EN/status.json")" \
+  "[] False"
+if sx "$EN" status | grep -q ACCOUNT; then bad "no ACCOUNT column without accounts"
+else ok "no ACCOUNT column without accounts"; fi
+
+# ---------------------------------------------------------------------------
 section "Property 1: the split cannot oversubscribe"
 # ---------------------------------------------------------------------------
 

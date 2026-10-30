@@ -10,6 +10,7 @@ import Stratify.Cowork
 import Stratify.Ledger
 import Stratify.Allocate
 import Stratify.Collect
+import Stratify.Account
 
 /-!
 # Command-line surface
@@ -170,12 +171,21 @@ def renderStatus (s : Collect.Snapshot) (home : String) : String := Id.run do
     out := out ++ "  available at all. Install with:\n\n"
     out := out ++ "    stratify install-sensor\n\n"
   else
-    out := out ++ s!"Rate-limit windows  [{provLabel s.prov}"
-    out := out ++ (if s.readingAge > 0 then s!", {Time.humanDuration s.readingAge} old]\n" else "]\n")
-    for w in s.windows do
-      out := out ++ windowLine w s.now ++ "\n"
-    for w in s.unknown do
-      out := out ++ unknownWindowLine w s.now ++ "\n"
+    -- One block per account that has readings. With no account known anywhere this is
+    -- a single unlabelled block: the output from before accounts were tracked.
+    let keys := (s.readings.map (·.1)).eraseDups
+    for k in keys do
+      let j := Collect.judgeReadings Guards.default s.now (s.readings.filter (·.1 == k))
+      if j.windows.isEmpty && j.unknown.isEmpty then continue
+      let who := match s.labelOf k with
+        | some l => s!" · {l}"
+        | none => ""
+      out := out ++ s!"Rate-limit windows{who}  [{provLabel j.prov}"
+      out := out ++ (if j.readingAge > 0 then s!", {Time.humanDuration j.readingAge} old]\n" else "]\n")
+      for w in j.windows do
+        out := out ++ windowLine w s.now ++ "\n"
+      for w in j.unknown do
+        out := out ++ unknownWindowLine w s.now ++ "\n"
     -- The case that reads as a broken tool unless it is spelled out: the sensor is
     -- installed and firing, and still has nothing to report, because Claude Code drops
     -- each window from the payload once its `resets_at` passes.
@@ -196,14 +206,19 @@ def renderStatus (s : Collect.Snapshot) (home : String) : String := Id.run do
   let cliN := (s.sessions.filter (·.origin == .cli)).size
   let coN := (s.sessions.filter (·.origin == .cowork)).size
   out := out ++ s!"Claimants: {s.sessions.size}  ({cliN} cli, {coN} cowork)\n\n"
+  -- The account column appears only when some session's account is known, and a
+  -- session whose account is not known gets a blank cell rather than a placeholder.
+  let acctCol := s.sessions.any (·.account.isSome)
+  let acctW := 2 + s.sessions.foldl (fun m r => max m ((r.account.map (·.label.length)).getD 0)) 0
   out := out ++ "  " ++ pad "SESSION" 28 ++ pad "MODEL" 26 ++ pad "STATUS" 9
-             ++ pad "TOKENS/5h" 11 ++ "CWD\n"
+             ++ pad "TOKENS/5h" 11 ++ (if acctCol then pad "ACCOUNT" acctW else "") ++ "CWD\n"
   for r in s.sessions do
     let nm := if r.name == "" then takeN r.sessionId 12 else r.name
+    let acct := if acctCol then pad ((r.account.map (·.label)).getD "") acctW else ""
     out := out ++ "  " ++ pad nm 28 ++ pad r.model 26
                ++ pad r.status.toString 9
                ++ pad (fmtTokens r.tally.total) 11
-               ++ tildify home r.cwd ++ "\n"
+               ++ acct ++ tildify home r.cwd ++ "\n"
   out := out ++ s!"\nTotal attributed in window: {fmtTokens (Collect.totalTokens s)} tokens\n"
   return out
 
@@ -220,7 +235,7 @@ def statusJson (s : Collect.Snapshot) : Json :=
        ("rolled_over", Json.bool (w.rolledOver s.now)),
        ("provenance", Json.str (provLabel w.prov))]
   let sessJson (r : SessionRec) : Json :=
-    Json.mkObj
+    Json.mkObj <|
       [("session_id", Json.str r.sessionId),
        ("origin", Json.str r.origin.toString),
        ("pid", Json.num (JsonNumber.fromNat r.pid)),
@@ -231,6 +246,10 @@ def statusJson (s : Collect.Snapshot) : Json :=
        ("cwd", Json.str r.cwd),
        ("tokens_in_window", Json.num (JsonNumber.fromNat r.tally.total)),
        ("last_activity", Json.num (JsonNumber.fromNat r.lastActivity))]
+      -- Absent, not null, when the account is not known.
+      ++ (match r.account with
+          | some a => [("account", Json.str a.label), ("account_key", Json.str a.key)]
+          | none => [])
   Json.mkObj
     [("now", Json.num (JsonNumber.fromNat s.now)),
      ("window_from", Json.num (JsonNumber.fromNat s.from_)),
@@ -248,6 +267,16 @@ def statusJson (s : Collect.Snapshot) : Json :=
      -- Reported so the gap is visible, never scheduled against.
      ("unknown_windows", Json.arr (s.unknown.map (fun w => Json.str w.kind.key)).toArray),
      ("sessions", Json.arr (s.sessions.map sessJson)),
+     -- Present only when some reading's account is known: the windows each account
+     -- sees, judged separately. Top-level `windows` stays the unscoped view.
+     ("accounts", Json.arr ((s.readings.map (·.1)).eraseDups.filterMap (fun k =>
+        if k == "" then none else
+        let j := Collect.judgeReadings Guards.default s.now (s.readings.filter (·.1 == k))
+        some (Json.mkObj
+          [("account", Json.str ((s.labelOf k).getD "")), ("account_key", Json.str k),
+           ("provenance", Json.str (provLabel j.prov)),
+           ("windows", Json.arr (j.windows.map winJson).toArray),
+           ("unknown_windows", Json.arr (j.unknown.map (fun w => Json.str w.kind.key)).toArray)]))).toArray),
      ("total_tokens_in_window", Json.num (JsonNumber.fromNat (Collect.totalTokens s)))]
 
 def status (asJson : Bool) : IO UInt32 := do
@@ -275,6 +304,13 @@ def resolveSessionId (explicit : Option String) : IO (Option String) := do
   | some s => return some s
   | none => return ← IO.getEnv "CLAUDE_CODE_SESSION_ID"
 
+/-- The snapshot this session should plan against: scoped to its own account when that
+is known, otherwise unscoped — everyone it might be sharing with counts. -/
+def planScope (g : Guards) (snap : Collect.Snapshot) (sid : String) : Collect.Snapshot :=
+  match (snap.sessions.find? (·.sessionId == sid)).bind (·.account) with
+  | some a => snap.scope g a.key
+  | none => snap
+
 /-- Build a plan for one session. -/
 def buildPlan (g : Guards) (snap : Collect.Snapshot) (entries : List Ledger.Entry)
     (sid : String) (niceOverride : Option Int) : Plan :=
@@ -298,7 +334,10 @@ def buildPlan (g : Guards) (snap : Collect.Snapshot) (entries : List Ledger.Entr
   planFor g snap.now sid snap.windows allWeights myWeight
 
 def planJson (p : Plan) (snap : Collect.Snapshot) : Json :=
-  Json.mkObj
+  let acct := match (snap.sessions.find? (·.sessionId == p.sessionId)).bind (·.account) with
+    | some a => [("account", Json.str a.label)]
+    | none => []
+  Json.mkObj <| acct ++
     [("session_id", Json.str p.sessionId),
      ("binding_window", Json.str p.binding.key),
      ("weight", Json.num (JsonNumber.fromNat p.weight)),
@@ -346,7 +385,7 @@ def plan (args : List String) : IO UInt32 := do
     return 2
   | some sid =>
     let niceOverride := (flagValue args "--nice").bind (fun s => s.toInt?)
-    let snap ← Collect.snapshot
+    let snap := planScope Guards.default (← Collect.snapshot) sid
     let entries ← Ledger.load
     let p := buildPlan Guards.default snap entries sid niceOverride
     if hasFlag args "--human" then IO.print (renderPlan p)
@@ -397,6 +436,18 @@ def gc (args : List String) : IO UInt32 := do
       let tmp := spath.withExtension "ndjson.tmp"
       IO.FS.writeFile tmp (String.intercalate "\n" kept ++ "\n")
       IO.FS.rename tmp spath
+  -- And the account map, the same way.
+  let apath ← Paths.accountsFile
+  if ← apath.pathExists then
+    let lines ← Ndjson.readAll apath
+    let kept := lines.toList.filter fun l =>
+      match Account.decodeEntry l with
+      | some (t, _, _) => t ≥ cutoff
+      | none => false
+    if kept.length < lines.size then
+      let tmp := apath.withExtension "ndjson.tmp"
+      IO.FS.writeFile tmp (String.intercalate "\n" kept ++ "\n")
+      IO.FS.rename tmp apath
   IO.println s!"stratify: dropped {sDropped} samples and {dropped} ledger records older than {days}d"
   return 0
 

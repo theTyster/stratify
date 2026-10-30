@@ -31,6 +31,10 @@ def samplesFile : IO System.FilePath := do return (← stratifyHome) / "samples.
 /-- Declarations: priority claims, sprint boundaries, yields. -/
 def ledgerFile : IO System.FilePath := do return (← stratifyHome) / "ledger.ndjson"
 
+/-- Which account each session was seen on, so a reading keeps its account after the
+session that wrote it exits. Keys only: see `Account.lean`. -/
+def accountsFile : IO System.FilePath := do return (← stratifyHome) / "accounts.ndjson"
+
 /-! ## Claude Code (read-only) -/
 
 /-- Live session registry, one `<pid>.json` per session. -/
@@ -49,6 +53,10 @@ directory holding that session's `audit.jsonl`. -/
 def coworkRoot : IO System.FilePath := do
   return (← home) / "Library" / "Application Support" / "Claude"
     / "local-agent-mode-sessions"
+
+/-- A process's environment, NUL-separated. Linux only; absent elsewhere, and then
+no account is reported rather than one guessed. -/
+def procEnviron (pid : Nat) : System.FilePath := s!"/proc/{pid}/environ"
 
 /-! ## Helpers -/
 

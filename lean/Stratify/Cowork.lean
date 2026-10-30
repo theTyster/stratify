@@ -4,6 +4,7 @@ import Stratify.Time
 import Stratify.Json
 import Stratify.Ndjson
 import Stratify.Paths
+import Stratify.Account
 
 /-!
 # Cowork sessions
@@ -165,6 +166,9 @@ def metaFiles : IO (Array System.FilePath) := do
 Archived sessions are skipped entirely: they cannot spend. -/
 def load (now from_ to_ : Epoch) : IO (Array CoworkSession) := do
   let mut out : Array CoworkSession := #[]
+  -- The store is laid out `<accountUuid>/<orgUuid>/`, so the account is read straight
+  -- off the path. The email is only shown when the default login is that same account.
+  let login ← Account.readLogin ((← Paths.home) / ".claude.json")
   for f in ← metaFiles do
     let txt ← try IO.FS.readFile f catch _ => pure ""
     match parseMeta txt now with
@@ -174,8 +178,19 @@ def load (now from_ to_ : Epoch) : IO (Array CoworkSession) := do
       -- `local_<uuid>.json` sits beside the `local_<uuid>/` directory.
       let dir := f.withExtension ""
       let scan ← scanAudit dir from_ to_
+      let orgDir := f.parent.getD ""
+      let acctDir := orgDir.parent.getD ""
+      let account : Option Account :=
+        match acctDir.fileName, orgDir.fileName with
+        | some a, some o =>
+          let label := match login with
+            | some l => if l.account == a && l.email != "" then l.email
+                        else s!"account ·{String.ofList (a.toList.take 8)}"
+            | none => s!"account ·{String.ofList (a.toList.take 8)}"
+          some { key := Account.loginKey a o, label := label }
+        | _, _ => none
       out := out.push
-        { session := { sess with tally := scan.tally }
+        { session := { sess with tally := scan.tally, account := account }
           cliSessionId := cliId
           windows := scan.windows }
   return out

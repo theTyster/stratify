@@ -22,6 +22,12 @@ stratify claim --nice -5    # take a larger share
 
 <img src="docs/assets/share.svg" alt="Scheduling weight for each niceness from -20 to 19">
 
+## One machine, several accounts
+
+Sessions on different accounts don't share a window, so they don't share a split. On Linux, stratify reads which credential each session was started with (from its process environment, or else its config directory's login) and plans each account separately. `status` adds an `ACCOUNT` column when it knows.
+
+Credentials are hashed in memory. Only a short fingerprint like `api key ·3f2a` is ever kept or shown. Where an account can't be read, the session counts toward every split, as before.
+
 ## It says how sure it is
 
 | `provenance` | Meaning | What the plan does |
